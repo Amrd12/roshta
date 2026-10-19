@@ -1,6 +1,10 @@
 # Server Implementation Plan: Prescription Printing Automation
 
-This document defines the architectural specification and implementation roadmap for the **Roshta Python/Flask Service**. It incorporates all critical production feedback: **SQLite in WAL mode as the single source of truth**, an in-memory plan engine, synchronous transaction guarantees, Excel-safe CSV streaming with spillover buffers, and robust Windows filesystem adapters.
+This document defines the architectural specification and implementation roadmap for the **Roshta Python/Flask Service**.
+
+**Revision history:**
+- v1 – Initial plan (SQLite WAL, layered architecture)
+- v2 – Applied pre-build review corrections: double-batch fix, FULL sync, async finalization, boot_id restart detection, crash-proof CSV, Arabic font embedding, scanner hardening, verifier tolerance, trimmed over-engineering.
 
 ---
 
@@ -9,66 +13,72 @@ This document defines the architectural specification and implementation roadmap
 The server follows a clean layered architecture with strict separation between pure business logic, the transactional service layer, external adapters, and HTTP controllers.
 
 ```
-                  [ HTTP Clients / Photoshop UXP Plugin ]
-                                     │  (JSON / HTTP on 127.0.0.1)
-                                     ▼
-      ┌─────────────────────────────────────────────────────────────┐
-      │     Controllers (Flask Blueprints hosted on Waitress)       │
-      │   - Health, State, Jobs, Controls, Settings, CSV Export     │
-      └──────────────────────────────┬──────────────────────────────┘
-                                     │  (Invokes)
-                                     ▼
-      ┌─────────────────────────────────────────────────────────────┐
-      │          Service Layer (Owns Thread Lock & Storage)         │
-      │   - QueueService: Orchestrates jobs, leases & transactions  │
-      │   - ScannerService: Manages background non-blocking polling │
-      └──────────────┬───────────────────────────────┬──────────────┘
-                     │                               │
-          (Operates Pure Domain)             (Drives Synchronously)
-                     ▼                               ▼
-      ┌─────────────────────────────┐ ┌─────────────────────────────┐
-      │     Pure Domain Models      │ │   Single Source of Truth    │
-      │   - Batch & Slot rules      │ │   - SQLite (WAL Mode)       │
-      │   - In-memory Plan Cache    │ │     • holding_files (Queue) │
-      │   - Folder Exclusions       │ │     • batches (Committed)   │
-      │   - Doctor Name Regex       │ └──────────────┬──────────────┘
-      └─────────────────────────────┘                │ (After Commit)
-                     │                               ▼
-          (Uses via Interfaces)               ┌──────────────┐
-                     ▼                        │ CSV Exporter │
-      ┌─────────────────────────────────┐     │ (Spill-safe) │
-      │            Adapters             │     └──────────────┘
-      │   - FileSystem (Cross-drive)    │
-      │   - Image Verifiers (TIFF, JPEG)│
-      │   - Process / Power (Waitress)  │
-      │   - PDF Slip (ReportLab/Arabic) │
-      └─────────────────────────────────┘
+              [ HTTP Clients / Photoshop UXP Plugin ]
+                                 │  (JSON / HTTP on 127.0.0.1)
+                                 ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │     Controllers (Flask Blueprints hosted on Waitress)       │
+  │   - Health, State, Jobs, Controls, Settings, CSV Export     │
+  └──────────────────────────────┬──────────────────────────────┘
+                                 │  (Invokes)
+                                 ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │          Service Layer (Owns Thread Lock & Storage)         │
+  │   - QueueService: Orchestrates jobs, leases & transactions  │
+  │   - ScannerService: Non-blocking background poller (5 s)   │
+  │   - JobFinalizerWorker: Async TIFF verify + file finalize   │
+  └──────────────┬───────────────────────────────┬──────────────┘
+                 │                               │
+      (Operates Pure Domain)             (Drives Synchronously)
+                 ▼                               ▼
+  ┌─────────────────────────────┐ ┌─────────────────────────────┐
+  │     Pure Domain Models      │ │   Single Source of Truth    │
+  │   - Batch & Slot rules      │ │   - SQLite (WAL + FULL)     │
+  │   - In-memory Plan Cache    │ │     • holding_files (Stage) │
+  │   - Folder Exclusions       │ │     • batches (Committed)   │
+  │   - Doctor Name Regex       │ └──────────────┬──────────────┘
+  └─────────────────────────────┘                │ (After Commit)
+                 │                               ▼
+     (Uses via Interfaces)               ┌──────────────┐
+                 ▼                        │ CSV Exporter │
+  ┌─────────────────────────────────┐     │ (Retry-safe) │
+  │            Adapters             │     └──────────────┘
+  │   - FileSystem (Cross-drive)    │
+  │   - TIFF Verifier (one fn)      │
+  │   - Process / Power (psutil)    │
+  │   - PDF Slip (ReportLab+Arabic) │
+  └─────────────────────────────────┘
 ```
 
 ### 1.1 Layer Responsibilities
 
 1. **Controllers (`server/controllers/`):**
-   * Flask routes served in production via **`waitress`** (pure Python, multi-threaded, robust on Windows, seamlessly packages with PyInstaller).
-   * Extracts headers (`X-Token`), parses and validates JSON inputs, maps domain exceptions to uniform HTTP error codes (401, 404, 409, 422, 423), and renders views.
+   * Flask routes served via **`waitress`** (multi-threaded, robust on Windows, PyInstaller-friendly).
+   * Extracts `X-Token`, parses JSON, maps domain exceptions to HTTP codes (401, 404, 409, 422, 423), renders views via `serializers.py`.
+
 2. **Service Layer (`server/services/`):**
-   * **`QueueService`:** Owns the primary re-entrant lock (`threading.RLock`). Coordinates job dispatching, lease timers, and status changes. Guarantees that any state affecting correctness is written **synchronously to SQLite inside a database transaction before replying to HTTP requests**.
-   * **`ScannerService`:** Background daemon performing non-blocking directory scans using state-snapshot diffing, maintaining two-way synchronization between disk files and the `holding_files` database table.
+   * **`QueueService`:** Owns the primary re-entrant lock (`threading.RLock`). Serves `/state` from an **immutable in-memory snapshot** swapped atomically so polling never blocks. Mutating operations write synchronously to SQLite *before* replying.
+   * **`ScannerService`:** Background daemon scanning every **5 seconds** using state-snapshot diffing, with two-tier file stability (size+mtime unchanged, then `open(rb)` succeeds).
+   * **`JobFinalizerWorker`:** Single worker thread consuming a `queue.Queue`. `/job-result` enqueues a finalization task and returns `202 Accepted` in < 5 ms. The worker then verifies TIFFs, moves files, and marks batches `done` without holding the RLock.
+   * **`LeaseReaperDaemon`:** Background thread that runs every 15 s querying `WHERE status='leased' AND lease_expires_at < CURRENT_TIMESTAMP` to reclaim timed-out batches.
+
 3. **Pure Domain Models (`server/models/`):**
    * Decoupled from Flask, SQLite, and network logic.
-   * Entities: `Batch`, `PrescriptionFile`, `PlanTree`, `FolderExclusions`, `AddressBook`.
-   * Encapsulate slot math, quadrant assignment (TL, TR, BL, BR), doctor name normalization regex, and in-memory tree grouping.
-4. **Single Source of Truth: SQLite with WAL Mode (`server/database.py`):**
-   * SQLite configured with `PRAGMA journal_mode=WAL;` and `PRAGMA synchronous=NORMAL;` for high-concurrency read/write operations without table locking.
-   * **Staging Queue (`holding_files`):** All stable incoming files waiting to be batched are staged here with clinic, paper weight, and operator skip toggles (`is_skipped`).
-   * **Committed Batches (`batches` & `batch_slots`):** When leased, files are atomically promoted from `holding_files` to `batches`.
-   * **Zero Disk Overhead for Polling:** High-frequency `/state?rev=N` polling is answered directly from an in-memory cached tree built from `holding_files`, invalidated only when disk files change or selections toggle.
+   * Entities: `Batch`, `PrescriptionFile`, `PlanTree`, `FolderExclusions`.
+   * Slot ordering rule: **oldest `first_seen_at` first, tie-broken by `file_path ASC`**.
 
-5. **CSV Exporter with Excel Lock Resilience (`server/services/csv_service.py`):**
-   * CSV is treated as an append-only reporting export executed **after** the SQLite transaction commits.
-   * **Excel Locking Mitigation:** Windows Excel takes an exclusive lock when an operator opens `master_daily_log.csv`. If writing fails with `PermissionError`:
-     * The row is written to a fallback spill buffer file (`logs/csv_spillover.csv`).
-     * A persistent warning flag (`csv_locked: true`) is exposed in `/state`.
-     * A background flush task automatically drains the spillover buffer into the main CSV once Excel is closed.
+4. **Single Source of Truth: SQLite (`server/database.py`):**
+   * `PRAGMA journal_mode = WAL;`
+   * `PRAGMA synchronous  = FULL;`  — survives power loss; write volume is tiny.
+   * `PRAGMA busy_timeout = 5000;`  — 5 s retry window for Waitress thread contention.
+   * `PRAGMA foreign_keys = ON;`
+   * One connection per thread (`check_same_thread=True`).
+
+5. **CSV Exporter (crash-proof, no spillover file):**
+   * After each SQLite `COMMIT` to `done`, the finalizer calls `CsvService.export_pending()`.
+   * `CsvService` queries `WHERE status='done' AND csv_exported_at IS NULL` and attempts to append rows. On success it sets `csv_exported_at = CURRENT_TIMESTAMP` in a separate transaction.
+   * If the master CSV is Excel-locked (`PermissionError`), the rows remain unexported in SQLite. A `/state` warning flag `csv_locked: true` is surfaced. The exporter retries on the next finalization or on a 60 s background ticker.
+   * **No spillover file, no duplicate risk:** the retry is idempotent because `csv_exported_at` is the guard.
 
 ---
 
@@ -76,568 +86,446 @@ The server follows a clean layered architecture with strict separation between p
 
 ```
 server/
-├── app.py                       # App factory, blueprints registration, Waitress runner
-├── config.py                    # Environment, paths, token resolution, configurable regex
-├── database.py                  # SQLite connection, WAL mode, migrations, schema_version
+├── app.py                       # App factory, blueprint registration, Waitress runner
+├── config.py                    # Env, paths, token, filename regex, lease_seconds
+├── database.py                  # SQLite connection, WAL pragmas, migrations, boot_id
+├── serializers.py               # All response formatters (replaces views/ folder)
 │
-├── controllers/                 # HTTP Routing & Request/Response Serialization
+├── controllers/
 │   ├── __init__.py
 │   ├── health_controller.py     # GET /health
-│   ├── state_controller.py      # GET /state, POST /selection
-│   ├── job_controller.py        # GET /next-job, POST /job-heartbeat, POST /job-result
-│   ├── control_controller.py    # POST /control (play, pause, stop, force_batch, etc.)
+│   ├── state_controller.py      # GET /state?rev=N, POST /selection
+│   ├── job_controller.py        # POST /lease, POST /job-heartbeat, POST /job-result
+│   ├── control_controller.py    # POST /control
 │   ├── settings_controller.py   # GET /settings, POST /settings
-│   └── export_controller.py     # GET /csv, GET /feed, GET /debug/state-dump
+│   └── export_controller.py     # GET /csv, GET /feed
 │
-├── services/                    # Transactional Orchestration & Thread Locking
+├── services/
 │   ├── __init__.py
-│   ├── queue_service.py         # Main thread-safe state machine & SQLite coordinator
-│   ├── scanner_service.py       # Non-blocking directory poller (snapshot comparison)
-│   ├── csv_service.py           # Excel-resilient CSV logger with spillover buffer
-│   └── recovery_service.py      # Boot-time crash detection & orphaned lease reclaimer
+│   ├── queue_service.py         # Thread-safe state machine & lease logic
+│   ├── scanner_service.py       # Non-blocking directory poller (5 s)
+│   ├── finalizer_worker.py      # Async TIFF verify + file finalization queue
+│   ├── lease_reaper.py          # Background lease expiry daemon (15 s)
+│   ├── csv_service.py           # Retry-safe CSV export (no spillover file)
+│   └── recovery_service.py      # Boot-time orphaned lease reclaimer
 │
-├── models/                      # Pure Domain Models (Zero external dependencies)
+├── models/
 │   ├── __init__.py
-│   ├── batch.py                 # Batch entity, slot allocations, dimensions
+│   ├── batch.py                 # Batch entity, slot allocations, slot ordering rule
 │   ├── prescription.py          # Doctor prescription metadata & name parsing
-│   ├── plan_tree.py             # In-memory tree builder, revision tracker (rev)
-│   ├── selection_rules.py       # Skip/include filters, persistence rules
-│   └── address_book.py          # Clinic addresses and delivery metadata
+│   ├── plan_tree.py             # In-memory tree builder + rev + boot_id
+│   └── selection_rules.py       # Skip/include filters
 │
-├── views/                       # Response Presenters / Serializers
+├── adapters/
 │   ├── __init__.py
-│   ├── state_view.py            # Formats /state response from in-memory plan
-│   ├── job_view.py              # Formats /next-job contract
-│   ├── health_view.py           # Formats /health and resume summary
-│   └── error_view.py            # Uniform error envelopes
+│   ├── filesystem_adapter.py    # Stable file detection, cross-drive safe_move
+│   ├── image_verifier/          # Polymorphic output image verification
+│   │   ├── __init__.py
+│   │   ├── base.py              # BaseImageVerifier ABC (template method: verify)
+│   │   ├── tiff_verifier.py     # TiffVerifier: tifffile, DPI tags, ±px tolerance, strided blank check
+│   │   ├── jpeg_verifier.py     # JpegVerifier: Pillow JFIF/EXIF DPI, SOF frame integrity
+│   │   └── factory.py           # ImageVerifierFactory.verify_file(path, ...) → (bool, str)
+│   ├── process_adapter.py       # psutil Photoshop watcher & Windows power commands
+│   └── slip_adapter.py          # ReportLab PDF + Arabic reshaper + embedded TTF
 │
-└── adapters/                    # External Interfaces & OS Operations
-    ├── __init__.py
-    ├── filesystem_adapter.py    # Non-blocking scan diffing, cross-drive atomic move
-    ├── image_verifier/          # Polymorphic Image Verification (TIFF, JPEG, etc.)
-    │   ├── __init__.py
-    │   ├── base.py              # BaseImageVerifier (ABC with template method)
-    │   ├── tiff_verifier.py     # TiffVerifier (tifffile, pages, tags, DPI)
-    │   ├── jpeg_verifier.py     # JpegVerifier (Pillow, JFIF/EXIF DPI, SOF integrity)
-    │   └── factory.py           # ImageVerifierFactory (resolves verifier by extension)
-    ├── process_adapter.py       # Psutil Photoshop watcher & Windows power commands
-    └── slip_adapter.py          # ReportLab PDF generator with Arabic reshaping
-
+├── migrations/
+│   └── init.sql                 # v1 schema (see §3)
+│
+├── backups/                     # Daily SQLite backups (roshta_YYYYMMDD.db)
+└── logs/                        # Rotating file logs (server.log)
 ```
 
 ---
 
-## 3. Database Schema (SQLite with WAL Mode)
+## 3. Database Schema
 
-SQLite is the **sole source of truth**, split cleanly into two stages:
-1. **`holding_files`:** The incoming staging queue of scanned, verified files waiting to form batches.
-2. **`batches` & `batch_slots`:** Production batches that have been leased, are rendering, or are finished.
+### 3.1 Full Schema (`migrations/init.sql`)
 
 ```sql
-PRAGMA journal_mode = WAL;
-PRAGMA synchronous = NORMAL;
-PRAGMA foreign_keys = ON;
+-- PRAGMAs applied at connection time by database.py:
+--   PRAGMA journal_mode = WAL;
+--   PRAGMA synchronous  = FULL;
+--   PRAGMA busy_timeout = 5000;
+--   PRAGMA foreign_keys = ON;
 
--- Schema Version Tracking
-CREATE TABLE IF NOT EXISTS schema_version (
-    version INTEGER PRIMARY KEY,
-    applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-INSERT OR IGNORE INTO schema_version (version) VALUES (1);
-
--- 1. STAGING QUEUE: Incoming files scanned from disk
+-- 1. STAGING QUEUE
+--    Files are NEVER deleted on batch promotion.
+--    They are marked status='locked' + batch_id so the scanner ignores them.
+--    They are deleted only after safe_move() moves the PSD to Finished/.
 CREATE TABLE IF NOT EXISTS holding_files (
-    id TEXT PRIMARY KEY,                       -- Unique hash of file_path
-    file_path TEXT UNIQUE NOT NULL,            -- Absolute path on disk
-    clinic TEXT NOT NULL,
-    paper_weight TEXT NOT NULL,
-    doctor_name TEXT NOT NULL,
-    file_size INTEGER NOT NULL,
-    mtime REAL NOT NULL,
-    first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    is_skipped INTEGER DEFAULT 0,              -- 0 = included, 1 = skipped by operator
-    status TEXT DEFAULT 'waiting'              -- 'waiting', 'locked'
+    id              TEXT PRIMARY KEY,       -- SHA-1 of normalised file_path
+    file_path       TEXT UNIQUE NOT NULL,
+    clinic          TEXT NOT NULL,
+    paper_weight    TEXT NOT NULL,
+    doctor_name     TEXT NOT NULL,
+    file_size       INTEGER NOT NULL,
+    mtime           REAL NOT NULL,
+    first_seen_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    is_skipped      INTEGER DEFAULT 0,      -- 1 = operator excluded
+    status          TEXT DEFAULT 'waiting', -- 'waiting' | 'locked'
+    batch_id        TEXT,
+    FOREIGN KEY (batch_id) REFERENCES batches(id) ON DELETE SET NULL
 );
-CREATE INDEX IF NOT EXISTS idx_holding_group ON holding_files(clinic, paper_weight, is_skipped);
+CREATE INDEX IF NOT EXISTS idx_holding_group
+    ON holding_files(clinic, paper_weight, status, is_skipped);
+CREATE INDEX IF NOT EXISTS idx_holding_batch ON holding_files(batch_id);
 
--- 2. COMMITTED PRODUCTION BATCHES (Persisted from 'leased' onward)
+-- 2. PRODUCTION BATCHES
 CREATE TABLE IF NOT EXISTS batches (
-    id TEXT PRIMARY KEY,                       -- e.g. "batch_20261019_001"
-    batch_number TEXT UNIQUE,                  -- e.g. "B00142" (assigned upon lease)
-    lease_id TEXT,                             -- UUID issued with current lease
-    clinic TEXT NOT NULL,
-    paper_weight TEXT NOT NULL,
-    status TEXT NOT NULL,                      -- 'ready', 'leased', 'verifying', 'finalizing', 'done', 'failed', 'interrupted', 'flagged'
-    attempt_count INTEGER DEFAULT 1,
-    slot_count INTEGER DEFAULT 4,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    leased_at TIMESTAMP,
-    lease_expires_at TIMESTAMP,
-    completed_at TIMESTAMP,
-    duration_ms INTEGER,
-    print_temp_path TEXT,
-    tracker_temp_path TEXT,
-    print_final_path TEXT,
-    tracker_final_path TEXT,
-    error_message TEXT
+    id                  TEXT PRIMARY KEY,
+    batch_number        TEXT UNIQUE,        -- 'B00142'; assigned at lease time
+    lease_id            TEXT,
+    clinic              TEXT NOT NULL,
+    paper_weight        TEXT NOT NULL,
+    status              TEXT NOT NULL,      -- 'leased'|'verifying'|'finalizing'
+                                            -- |'done'|'failed'|'interrupted'|'flagged'
+    attempt_count       INTEGER DEFAULT 1,
+    slot_count          INTEGER DEFAULT 4,
+    is_forced           INTEGER DEFAULT 0,  -- Force-batch with < 4 designs
+    created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    leased_at           TIMESTAMP,
+    lease_expires_at    TIMESTAMP,          -- Reaped by LeaseReaperDaemon
+    completed_at        TIMESTAMP,
+    duration_ms         INTEGER,
+    print_temp_path     TEXT,
+    tracker_temp_path   TEXT,
+    print_final_path    TEXT,
+    tracker_final_path  TEXT,
+    csv_exported_at     TIMESTAMP,          -- NULL until exported; retry guard
+    slip_generated_at   TIMESTAMP,
+    error_message       TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_batches_status ON batches(status);
-CREATE INDEX IF NOT EXISTS idx_batches_lease ON batches(lease_id);
+CREATE INDEX IF NOT EXISTS idx_batches_lease  ON batches(lease_id);
+-- Partial index: only unexported done batches need scanning
+CREATE INDEX IF NOT EXISTS idx_batches_csv ON batches(csv_exported_at)
+    WHERE csv_exported_at IS NULL;
 
--- Quadrant Item Allocations
+-- 3. QUADRANT SLOT ALLOCATIONS
 CREATE TABLE IF NOT EXISTS batch_slots (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    batch_id TEXT NOT NULL,
-    slot TEXT NOT NULL,                        -- 'TL', 'TR', 'BL', 'BR'
-    doctor_name TEXT NOT NULL,
-    source_path TEXT NOT NULL,
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id      TEXT NOT NULL,
+    slot          TEXT NOT NULL,            -- 'TL'|'TR'|'BL'|'BR'
+    doctor_name   TEXT NOT NULL,
+    source_path   TEXT NOT NULL,
     finished_path TEXT,
-    x_cm REAL NOT NULL,
-    y_cm REAL NOT NULL,
+    x_cm          REAL NOT NULL,
+    y_cm          REAL NOT NULL,
+    is_empty      INTEGER DEFAULT 0,        -- 1 = white-fill placeholder
     FOREIGN KEY (batch_id) REFERENCES batches(id) ON DELETE CASCADE
 );
+CREATE INDEX IF NOT EXISTS idx_slots_batch ON batch_slots(batch_id);
 
--- Sticky Folder Exclusions (File-level skips are stored directly in holding_files.is_skipped)
+-- 4. STICKY FOLDER EXCLUSIONS
 CREATE TABLE IF NOT EXISTS folder_exclusions (
     folder_path TEXT PRIMARY KEY,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Address Book for Delivery Slips
-CREATE TABLE IF NOT EXISTS address_book (
-    clinic_name TEXT PRIMARY KEY,
-    address_line TEXT NOT NULL,
-    phone TEXT,
-    notes TEXT,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- System State & Counters
+-- 5. SYSTEM STATE & COUNTERS
 CREATE TABLE IF NOT EXISTS system_state (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL,
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+INSERT OR IGNORE INTO system_state (key, value) VALUES ('next_batch_number', '1');
+INSERT OR IGNORE INTO system_state (key, value) VALUES ('boot_id', '');
 ```
 
-### 3.1 The Atomic Promotion Transaction (Holding -> Batches)
-When 4 designs in `holding_files` match a clinic and paper weight (or when the operator triggers Force Batch), they are promoted to `batches` in a single ACID transaction:
+### 3.2 Atomic Promotion Transaction (`POST /lease`)
+
+**Slot ordering rule:** 4 oldest `first_seen_at ASC, file_path ASC` files selected per clinic+paper_weight group.
 
 ```sql
-BEGIN TRANSACTION;
+BEGIN IMMEDIATE;
 
--- 1. Create the committed batch record
+-- A. Atomically increment batch counter and capture new number
+UPDATE system_state
+SET    value      = CAST(value AS INTEGER) + 1,
+       updated_at = CURRENT_TIMESTAMP
+WHERE  key = 'next_batch_number';
+
+SELECT printf('B%05d', CAST(value AS INTEGER) - 1)
+FROM   system_state WHERE key = 'next_batch_number';
+
+-- B. Insert the committed batch record
 INSERT INTO batches (
-    id, batch_number, lease_id, clinic, paper_weight, status, slot_count, leased_at, lease_expires_at
+    id, batch_number, lease_id, clinic, paper_weight,
+    status, slot_count, is_forced, leased_at, lease_expires_at
 ) VALUES (
-    'batch_20261019_001', 'B00142', 'lease_9f2a', 'Al-Amal', 'Standard', 'leased', 4, CURRENT_TIMESTAMP, datetime('now', '+600 seconds')
+    :batch_id, :batch_number, :lease_id, :clinic, :paper_weight,
+    'leased', :slot_count, :is_forced,
+    CURRENT_TIMESTAMP, datetime('now', '+' || :lease_seconds || ' seconds')
 );
 
--- 2. Allocate the 4 quadrant slots
-INSERT INTO batch_slots (batch_id, slot, doctor_name, source_path, x_cm, y_cm) VALUES
-('batch_20261019_001', 'TL', 'Dr_Sarah', 'D:/Roshta/Input/Al-Amal/Standard/Dr_Sarah.psd', 0.0, 0.0),
-('batch_20261019_001', 'TR', 'Dr_Ahmed', 'D:/Roshta/Input/Al-Amal/Standard/Dr_Ahmed.psd', 25.0, 0.0),
-('batch_20261019_001', 'BL', 'Dr_Mona',  'D:/Roshta/Input/Al-Amal/Standard/Dr_Mona.psd',  0.0, 17.0),
-('batch_20261019_001', 'BR', 'Dr_Ziad',  'D:/Roshta/Input/Al-Amal/Standard/Dr_Ziad.psd',  25.0, 17.0);
+-- C. Insert quadrant slots
+INSERT INTO batch_slots (batch_id, slot, doctor_name, source_path, x_cm, y_cm, is_empty)
+VALUES (:batch_id, 'TL', :doctor_tl, :path_tl, 0.0,  0.0,  :empty_tl),
+       (:batch_id, 'TR', :doctor_tr, :path_tr, 25.0, 0.0,  :empty_tr),
+       (:batch_id, 'BL', :doctor_bl, :path_bl, 0.0,  17.0, :empty_bl),
+       (:batch_id, 'BR', :doctor_br, :path_br, 25.0, 17.0, :empty_br);
 
--- 3. Delete the promoted files from the staging queue so they cannot be double-batched
-DELETE FROM holding_files WHERE file_path IN (
-    'D:/Roshta/Input/Al-Amal/Standard/Dr_Sarah.psd',
-    'D:/Roshta/Input/Al-Amal/Standard/Dr_Ahmed.psd',
-    'D:/Roshta/Input/Al-Amal/Standard/Dr_Mona.psd',
-    'D:/Roshta/Input/Al-Amal/Standard/Dr_Ziad.psd'
-);
+-- D. Lock files in holding_files — DO NOT DELETE THEM
+--    Scanner will see status='locked' and skip them.
+--    They are deleted only after safe_move() completes in JobFinalizerWorker.
+UPDATE holding_files
+SET    status   = 'locked',
+       batch_id = :batch_id
+WHERE  id IN (:file_id_tl, :file_id_tr, :file_id_bl, :file_id_br);
 
 COMMIT;
 ```
 
+### 3.3 Finalization Flow (Async — `JobFinalizerWorker`)
+
+```
+POST /job-result  ──►  Mark batch 'verifying' (< 5 ms transaction)
+                  ──►  202 Accepted          (returns immediately)
+                  ──►  Enqueue to JobFinalizerWorker.queue
+
+JobFinalizerWorker (background thread):
+  1. verify_tiff(print_temp_path, ±2 px tolerance, strided blank check)
+  2. verify_tiff(tracker_temp_path, ±2 px tolerance)
+  3. Mark batch 'finalizing'
+  4. Rename temp TIFFs → final names  (atomic rename on same volume)
+  5. safe_move() each source PSD → Finished/<clinic>/<date>/
+     ├── On success: UPDATE batch_slots SET finished_path = ...
+     └── On cross-device: stream to .part file, rename, delete source
+  6. DELETE FROM holding_files WHERE batch_id = :batch_id
+  7. UPDATE batches SET status='done', completed_at=...
+  8. CsvService.export_pending()   (retry-safe; sets csv_exported_at)
+  9. PdfSlipAdapter.generate_slip() if enabled   (sets slip_generated_at)
+ 10. Atomically swap QueueService._state_snapshot (rev++)
+```
+
+On TIFF verification failure → mark batch `flagged`, keep temp files for inspection, do NOT move source PSDs.
 
 ---
 
-## 4. Robust Adapter & Service Implementations
+## 4. Key Adapter Implementations
 
 ### 4.1 Non-Blocking File Stability Scanner (`filesystem_adapter.py`)
-**Problem Solved:** Never sleep inside the file scanning loop. Instead, track `(size, mtime)` in a dictionary across background polling passes.
 
+Scan interval: **5 seconds** (reduced from 2 s to avoid hammering network shares).
+
+Two-tier stability check per file:
+1. **`(size, mtime)` unchanged** across two consecutive scans.
+2. **Exclusive open test:** `open(path, 'rb').close()` — raises `PermissionError` if another process (e.g. SMB copy) still holds the file open. File treated as unstable.
+
+Scanner → `holding_files` sync rules:
+- **New stable file:** `INSERT OR IGNORE INTO holding_files (...)`.
+- **File deleted from disk:** `DELETE FROM holding_files WHERE file_path = ? AND status = 'waiting'`. Locked files are never auto-deleted.
+- **File size or mtime changed:** `UPDATE holding_files SET file_size=?, mtime=?, first_seen_at=CURRENT_TIMESTAMP, is_skipped=0`. Resets skip (the file is effectively a new version).
+- **Folder excluded:** Applied at insert time via `SELECT 1 FROM folder_exclusions WHERE ? LIKE folder_path || '%'`. Never inserted.
+
+### 4.2 Image Verifier (`adapters/image_verifier/`)
+
+Polymorphic verifier kept because **both TIFF and JPEG outputs are required**.
+All callers go through `ImageVerifierFactory.verify_file()` — adding a new format later is a single new class + one factory entry.
+
+**`base.py` — Abstract Base:**
 ```python
-import os
-import shutil
-import time
-from typing import Dict, Tuple
-
-class FileSystemAdapter:
-    def __init__(self):
-        # Maps file_path -> (size, mtime, first_seen_timestamp)
-        self._seen_files: Dict[str, Tuple[int, float, float]] = {}
-
-    def scan_directory(self, root_dir: str, allowed_exts: Tuple[str, ...], min_age_seconds: float = 3.0):
-        """
-        Non-blocking scan. Returns list of fully stable files without sleeping.
-        A file is stable if size and mtime are identical across passes and file age >= min_age_seconds.
-        """
-        current_seen: Dict[str, Tuple[int, float, float]] = {}
-        stable_files = []
-        now = time.time()
-
-        for dirpath, _, filenames in os.walk(root_dir):
-            for fname in filenames:
-                if not fname.lower().endswith(allowed_exts):
-                    continue
-                full_path = os.path.join(dirpath, fname)
-                try:
-                    stat = os.stat(full_path)
-                    size, mtime = stat.st_size, stat.st_mtime
-                except (OSError, PermissionError):
-                    continue
-
-                if full_path in self._seen_files:
-                    prev_size, prev_mtime, first_seen = self._seen_files[full_path]
-                    if size == prev_size and mtime == prev_mtime and (now - first_seen) >= min_age_seconds:
-                        # Stability verified. Check read permissions.
-                        if os.access(full_path, os.R_OK):
-                            stable_files.append(full_path)
-                    current_seen[full_path] = (size, mtime, first_seen)
-                else:
-                    current_seen[full_path] = (size, mtime, now)
-
-        self._seen_files = current_seen
-        return stable_files
-
-    def safe_move(self, src: str, dst: str) -> str:
-        """
-        Cross-volume safe move. Never silently overwrites.
-        Falls back to copy + verify + delete across drive boundaries.
-        """
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        target = dst
-        # Collision resolution: append timestamp suffix if target exists
-        if os.path.exists(target):
-            base, ext = os.path.splitext(dst)
-            target = f"{base}_{int(time.time()*1000)}{ext}"
-
-        try:
-            # os.replace works atomically if on the same filesystem
-            os.replace(src, target)
-        except OSError:
-            # Cross-drive move fallback
-            shutil.copy2(src, target)
-            if os.path.getsize(target) == os.path.getsize(src):
-                os.remove(src)
-            else:
-                raise IOError(f"Copy verification failed for {src} to {target}")
-        return target
-```
-
-### 4.2 Multi-Format Image Verification Hierarchy (`adapters/image_verifier/`)
-To support multiple export formats (TIFF for lossless prepress RIPs, JPEG/PNG for lightweight proofing/trackers, etc.), verification uses an **Abstract Base Class (Template Method pattern)** with format-specific subclasses and a dynamic factory.
-
-```python
-# adapters/image_verifier/base.py
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-import os
-from typing import Tuple
-import numpy as np
-
-@dataclass
-class ImageMetadata:
-    width_px: int
-    height_px: int
-    dpi: float
-    page_count: int
-    color_mode: str
-    pixel_array: np.ndarray
 
 class BaseImageVerifier(ABC):
-    """Abstract Base Class defining the template method for image verification."""
-
-    def verify(self, path: str, expected_width_px: int, expected_height_px: int, expected_dpi: int) -> Tuple[bool, str]:
-        """Template method: executes shared pipeline and delegates format-specific parsing."""
-        if not os.path.exists(path) or os.path.getsize(path) == 0:
-            return False, f"File missing or empty: {path}"
-
-        try:
-            # 1. Format-specific integrity check
-            integrity_ok, msg = self._validate_format_integrity(path)
-            if not integrity_ok:
-                return False, msg
-
-            # 2. Format-specific metadata extraction
-            meta = self._extract_metadata(path)
-
-            # 3. Common dimension validation
-            if meta.width_px != expected_width_px or meta.height_px != expected_height_px:
-                return False, f"Dimension mismatch: got {meta.width_px}x{meta.height_px}, expected {expected_width_px}x{expected_height_px}"
-
-            # 4. Common DPI validation (with 2.0 tolerance for unit conversions)
-            if abs(meta.dpi - expected_dpi) > 2.0:
-                return False, f"DPI mismatch: got {meta.dpi:.1f}, expected {expected_dpi}"
-
-            # 5. Multi-page restriction (montage must be a single sheet)
-            if meta.page_count != 1:
-                return False, f"Expected 1 page/frame, found {meta.page_count}"
-
-            # 6. Non-blank check (ensures canvas contains varied pixel data, not solid white/black)
-            if np.all(meta.pixel_array == meta.pixel_array[0, 0]):
-                return False, "Image is blank/solid color"
-
-            return True, "OK"
-        except Exception as e:
-            return False, f"Verification failed with error: {str(e)}"
+    """
+    Template-method ABC. Subclasses implement _check_format_specific();
+    the base class handles the common pixel-dimension and DPI contract.
+    """
+    def verify(
+        self,
+        path: str,
+        expected_width_px: int,
+        expected_height_px: int,
+        expected_dpi: int,
+        px_tolerance: int = 2,
+    ) -> tuple[bool, str]:
+        ok, msg = self._open_and_check_dimensions(
+            path, expected_width_px, expected_height_px, expected_dpi, px_tolerance
+        )
+        if not ok:
+            return False, msg
+        return self._check_format_specific(path)
 
     @abstractmethod
-    def _validate_format_integrity(self, path: str) -> Tuple[bool, str]:
-        """Perform format-specific stream or header validation."""
-        pass
+    def _open_and_check_dimensions(
+        self, path, exp_w, exp_h, exp_dpi, tol
+    ) -> tuple[bool, str]: ...
 
     @abstractmethod
-    def _extract_metadata(self, path: str) -> ImageMetadata:
-        """Extract width, height, DPI, and pixel array using format-appropriate library."""
-        pass
+    def _check_format_specific(self, path: str) -> tuple[bool, str]: ...
 ```
 
+**`tiff_verifier.py` — TIFF:**
+- Opens with `tifffile`; reads `XResolution`, `YResolution`, `ResolutionUnit` tags.
+- Missing `ResolutionUnit` defaults to **inch** (per TIFF spec § 6.1 — not an error).
+- Pixel dimension check: `abs(actual_w - expected_w) <= px_tolerance` (tolerance absorbs 300 DPI rounding, e.g. 50 cm → 5905.5118 px).
+- Blank-page check: samples `page.asarray()[::50, ::50]` (strided) — avoids allocating the full ~70 MB array.
+
+**`jpeg_verifier.py` — JPEG:**
+- Opens with `Pillow`; reads DPI from `info['dpi']` (JFIF `APP0`) or EXIF `XResolution`/`YResolution`.
+- Validates SOF frame integrity (width × height from image header).
+- Same ±`px_tolerance` and DPI check.
+
+**`factory.py` — Entry Point:**
 ```python
-# adapters/image_verifier/tiff_verifier.py
-import tifffile
-from typing import Tuple
-from .base import BaseImageVerifier, ImageMetadata
-
-class TiffVerifier(BaseImageVerifier):
-    def _validate_format_integrity(self, path: str) -> Tuple[bool, str]:
-        try:
-            with tifffile.TiffFile(path) as tif:
-                if len(tif.pages) == 0:
-                    return False, "TIFF has no pages"
-            return True, "OK"
-        except Exception as e:
-            return False, f"Corrupted TIFF header: {str(e)}"
-
-    def _extract_metadata(self, path: str) -> ImageMetadata:
-        with tifffile.TiffFile(path) as tif:
-            page = tif.pages[0]
-            h, w = page.shape[0], page.shape[1]
-            
-            # ResolutionUnit: 2 = Inch, 3 = Centimeter
-            res_unit = page.tags.get("ResolutionUnit")
-            x_res_tag = page.tags.get("XResolution")
-            dpi = 0.0
-            if res_unit and x_res_tag:
-                unit_val = res_unit.value
-                x_res = x_res_tag.value[0] / x_res_tag.value[1]
-                dpi = x_res if unit_val == 2 else (x_res * 2.54 if unit_val == 3 else 0.0)
-
-            return ImageMetadata(
-                width_px=w,
-                height_px=h,
-                dpi=dpi,
-                page_count=len(tif.pages),
-                color_mode=str(page.photometric),
-                pixel_array=page.asarray()
-            )
-```
-
-```python
-# adapters/image_verifier/jpeg_verifier.py
-from PIL import Image
-import numpy as np
-from typing import Tuple
-from .base import BaseImageVerifier, ImageMetadata
-
-class JpegVerifier(BaseImageVerifier):
-    def _validate_format_integrity(self, path: str) -> Tuple[bool, str]:
-        try:
-            with Image.open(path) as img:
-                img.verify() # Validates JPEG markers and stream integrity
-            return True, "OK"
-        except Exception as e:
-            return False, f"Corrupted JPEG stream: {str(e)}"
-
-    def _extract_metadata(self, path: str) -> ImageMetadata:
-        # Re-open after verify() closes the file pointer
-        with Image.open(path) as img:
-            dpi_tuple = img.info.get("dpi", (72.0, 72.0))
-            dpi = float(dpi_tuple[0])
-            pixel_data = np.array(img)
-
-            return ImageMetadata(
-                width_px=img.width,
-                height_px=img.height,
-                dpi=dpi,
-                page_count=getattr(img, "n_frames", 1),
-                color_mode=img.mode,
-                pixel_array=pixel_data
-            )
-```
-
-```python
-# adapters/image_verifier/factory.py
-import os
-from typing import Dict, Tuple
-from .base import BaseImageVerifier
-from .tiff_verifier import TiffVerifier
-from .jpeg_verifier import JpegVerifier
-
 class ImageVerifierFactory:
-    _registry: Dict[str, BaseImageVerifier] = {
-        ".tif": TiffVerifier(),
+    _registry: dict[str, BaseImageVerifier] = {
+        ".tif":  TiffVerifier(),
         ".tiff": TiffVerifier(),
-        ".jpg": JpegVerifier(),
+        ".jpg":  JpegVerifier(),
         ".jpeg": JpegVerifier(),
     }
 
     @classmethod
-    def register(cls, ext: str, verifier: BaseImageVerifier):
-        cls._registry[ext.lower()] = verifier
-
-    @classmethod
-    def get_verifier(cls, path: str) -> BaseImageVerifier:
-        _, ext = os.path.splitext(path)
-        ext = ext.lower()
-        if ext not in cls._registry:
-            raise ValueError(f"No image verifier registered for extension '{ext}'")
-        return cls._registry[ext]
-
-    @classmethod
-    def verify_file(cls, path: str, expected_width_px: int, expected_height_px: int, expected_dpi: int) -> Tuple[bool, str]:
+    def verify_file(
+        cls,
+        path: str,
+        expected_width_px: int,
+        expected_height_px: int,
+        expected_dpi: int,
+        px_tolerance: int = 2,
+    ) -> tuple[bool, str]:
+        ext = os.path.splitext(path)[1].lower()
+        verifier = cls._registry.get(ext)
+        if verifier is None:
+            return False, f"Unsupported format: {ext}"
         try:
-            verifier = cls.get_verifier(path)
-            return verifier.verify(path, expected_width_px, expected_height_px, expected_dpi)
-        except ValueError as e:
-            return False, str(e)
+            return verifier.verify(
+                path, expected_width_px, expected_height_px,
+                expected_dpi, px_tolerance
+            )
+        except Exception as exc:
+            return False, f"Verifier exception: {exc}"
 ```
 
+All finalization calls use `ImageVerifierFactory.verify_file(path, ...)` — callers never import a concrete verifier class.
 
-### 4.3 Arabic-Ready Delivery Slip Generation (`slip_adapter.py`)
-Using pure **ReportLab** (no GTK/WeasyPrint dependencies) combined with `arabic-reshaper` and `python-bidi`:
+### 4.3 `safe_move()` (`adapters/filesystem_adapter.py`)
+
 ```python
-import arabic_reshaper
-from bidi.algorithm import get_display
-from reportlab.lib.pagesizes import A5
-from reportlab.pdfgen import canvas
+def safe_move(src: str, dst: str) -> None:
+    """
+    Atomically moves src to dst across any drive boundary.
 
-class PdfSlipAdapter:
-    def format_arabic(self, text: str) -> str:
-        if not text:
-            return ""
-        reshaped = arabic_reshaper.reshape(text)
-        return get_display(reshaped)
-
-    def generate_slip(self, output_pdf_path: str, clinic: str, batch_num: str, doctors: list, address: str):
-        c = canvas.Canvas(output_pdf_path, pagesize=A5)
-        c.setFont("Helvetica-Bold", 16)
-        c.drawString(40, 540, f"Batch: {batch_num}")
-        
-        # Render Arabic-safe text strings
-        c.drawString(40, 510, self.format_arabic(f"Clinic: {clinic}"))
-        c.drawString(40, 480, self.format_arabic(f"Address: {address}"))
-        
-        c.setFont("Helvetica", 12)
-        y = 440
-        c.drawString(40, y, "Included Prescriptions:")
-        for doc in doctors:
-            y -= 25
-            c.drawString(60, y, self.format_arabic(f"• Dr. {doc}"))
-        c.save()
+    - Same volume: os.rename() — instant, atomic.
+    - Cross-volume (errno.EXDEV): Stream src → dst.part, flush, rename
+      dst.part → dst, then delete src. Only catches errno.EXDEV, not a
+      locked-file OSError (which propagates to caller for retry).
+    """
 ```
 
-### 4.4 Excel-Safe CSV Service (`csv_service.py`)
-```python
-import csv
-import os
-import threading
+### 4.4 Arabic-Ready PDF Slip (`adapters/slip_adapter.py`)
 
-class CsvService:
-    def __init__(self, master_path: str, spill_path: str):
-        self._master_path = master_path
-        self._spill_path = spill_path
-        self._lock = threading.Lock()
-        self.csv_locked_warning = False
+- Font: Bundle **Amiri** or **Cairo** TTF inside the PyInstaller package (`--add-data`).
+- Reshaping: `arabic_reshaper.reshape()` + `bidi.algorithm.get_display()` applied **only** to dynamic Arabic data fields (clinic name, doctor names, address). English labels (e.g. "Batch:", "Date:") are passed through untouched.
+- Layout: RTL Arabic lines are right-aligned; LTR English labels are left-aligned.
 
-    def append_batch(self, row: dict):
-        with self._lock:
-            # Drain any previous spillover first if master is accessible
-            self._try_drain_spillover()
+### 4.5 Token Authentication Strategy
 
-            try:
-                self._write_row(self._master_path, row)
-                self.csv_locked_warning = False
-            except (PermissionError, IOError):
-                # Excel has locked the master file -> divert to spillover
-                self._write_row(self._spill_path, row)
-                self.csv_locked_warning = True
-
-    def _try_drain_spillover(self):
-        if not os.path.exists(self._spill_path):
-            return
-        try:
-            with open(self._spill_path, "r", encoding="utf-8-sig") as sf:
-                rows = list(csv.DictReader(sf))
-            if rows:
-                with open(self._master_path, "a", newline="", encoding="utf-8-sig") as mf:
-                    writer = csv.DictWriter(mf, fieldnames=rows[0].keys())
-                    writer.writerows(rows)
-            os.remove(self._spill_path)
-            self.csv_locked_warning = False
-        except (PermissionError, IOError):
-            pass # Still locked
-```
+- **Method:** Operator enters the token once in the Roshta plugin settings panel. Stored via UXP `localStorage`. No default fallback token.
+- **No file-based token delivery:** Writing the token to the source folder is dropped — that folder may be shared.
+- **Require explicit setup:** Server refuses to start without a configured `SECRET_TOKEN`. Plugin shows a setup screen until the token is saved.
 
 ---
 
-## 5. Token Authentication & UXP Sandboxing Strategy
+## 5. `/state` Response: `boot_id` for Restart Detection
 
-**The Problem:** The Photoshop UXP plugin is sandboxed and cannot arbitrarily read files from `%LOCALAPPDATA%`.
+Every `/state` response includes:
+```json
+{
+  "boot_id": "a3f9c1b2-...",
+  "rev": 57,
+  "mode": "running",
+  ...
+}
+```
 
-**The Solution:**
-1. **Configurable Token in `config.json`:** The server reads `SECRET_TOKEN` from `server/config.json` (or CLI `--token` flag). Default fallback can be a stable generated secret.
-2. **One-Time Setup in Plugin Settings:** The operator copies this token into the Roshta plugin settings panel once, where it is persisted via UXP's `localStorage`.
-3. **Automated Discovery (Alternative):** The Python server writes `roshta_session.token` into the root of the **Source Folder** (which the operator grants to the plugin). The plugin reads the token directly from the granted folder.
+If the plugin receives a different `boot_id` than what it cached, it treats the revision as invalidated, clears its local state snapshot, and re-renders the full tree regardless of `rev`.
+
+`boot_id` is stamped by `database.stamp_boot_id()` called once during `create_app()`.
 
 ---
 
-## 6. Server Build Roadmap (Vertical Slice First)
+## 6. Disk Space & Logging
 
-### Phase 1: Foundation & SQLite WAL Engine
-* Initialize `server/database.py` with schema versioning (`schema_version`), table creation, and WAL pragmas.
-* Configure `config.py` with configurable filename regex (`r"^(.*?)(?:[_\-\s]\d+)?\.(psd|psb|tif|tiff)$"`, case-insensitive).
-* Implement `app.py` wrapped with **`waitress`** server.
-* Add `X-Token` middleware and `GET /health` endpoint.
+- **Disk space check:** Before issuing any lease, `QueueService` checks available disk space on the output volume. If `< 5 GB`, no new jobs are leased and `/state` includes `disk_warning: true`.
+- **Daily SQLite backup:** On startup and then at midnight, `sqlite3.Connection.backup()` copies the live database to `backups/roshta_YYYYMMDD.db`. Only the last 7 days are retained.
+- **Logging:** Rotating file handler: `logs/server.log`, max 5 MB per file, 5 backups. Under `--noconsole` PyInstaller mode, `sys.stdout` is `None`; `app.py` redirects it to the log file at startup.
+
+---
+
+## 7. API Endpoints
+
+| Endpoint             | Method | Description |
+|---|---|---|
+| `/health`            | `GET`  | Status, uptime, PS process state, resume summary, `boot_id`. |
+| `/state?rev=N`       | `GET`  | Full plan tree, `boot_id`, `rev`, warnings, disk space. `304` if `rev` unchanged. |
+| `/selection`         | `POST` | Toggle `is_skipped` on holding_files nodes: `{ "rev": N, "skip": [...], "include": [...] }`. |
+| `/lease`             | `POST` | Lease one ready batch. Returns `200` with job contract or `204`. |
+| `/job-heartbeat`     | `POST` | Extend active lease: `{ "job_id": "...", "lease_id": "..." }`. |
+| `/job-result`        | `POST` | Report completion. Returns `202 Accepted` immediately; finalization is async. |
+| `/control`           | `POST` | `play`, `pause`, `stop`, `force_batch`, `retry`, `mark_reviewed`, `set_after_finish`, `cancel_after_finish`, `rescan`. |
+| `/settings`          | `GET`/`POST` | Read/update config (paths, templates, canvas, DPI, bleed, lease_seconds). |
+| `/feed?after=ID`     | `GET`  | Paginated activity feed. |
+| `/csv`               | `GET`  | Download master CSV. |
+
+---
+
+## 8. Build Phases
+
+### Phase 1: Foundation & SQLite WAL Engine ✅ DONE
+* `database.py` with WAL + FULL sync + boot_id.
+* `config.py` with configurable regex.
+* `app.py` with Waitress + X-Token middleware.
+* `GET /health` endpoint.
+* All tests passing in `tests/test_phase1.py`.
 
 ### Phase 2: Staging Queue & Non-Blocking Scanner
-* Implement `FileSystemAdapter` with snapshot comparison and two-way sync:
-  * Inserts newly stabilized files into `holding_files`.
-  * Prunes deleted/renamed ghost files (`DELETE FROM holding_files WHERE file_path NOT IN (...)`).
-* Implement `ScannerService` daemon running every 2.0 seconds.
-* Implement `GET /state?rev=N` and `POST /selection`:
-  * `POST /selection` toggles `holding_files.is_skipped` directly in SQLite.
-  * Rebuilds in-memory plan tree cache and increments `rev`.
+* `FileSystemAdapter`: 5 s snapshot diff, two-tier stability, `safe_move`.
+* `ScannerService` daemon.
+* `PlanTree` in-memory builder with `rev`.
+* `GET /state?rev=N` (served from immutable snapshot).
+* `POST /selection` (toggles `is_skipped` in SQLite).
+* `tests/test_phase2.py`.
 
-### Phase 3: Vertical Slice: Atomic Batch Promotion & Job Leasing
-* Implement `QueueService`:
-  * `GET /next-job`: Executes the atomic SQL transaction: inserts `batches` + `batch_slots`, deletes promoted files from `holding_files`, and returns job contract.
-  * In-memory lease timer (10-minute expiry with auto-reclaim).
-* Implement `POST /job-result`:
-  * Synchronously updates SQLite status to `verifying`.
-  * Verifies output images via `ImageVerifierFactory.verify_file(path, ...)`.
-  * Multi-step safe move of source files to `Finished` (marked `finalizing` during file moves).
-  * Updates SQLite status to `done`.
+### Phase 3: Atomic Lease & Fake Worker Validation
+* `QueueService` with `POST /lease`, lease timer, `LeaseReaperDaemon`.
+* `JobFinalizerWorker`: TIFF verify, `safe_move`, CSV, slip, `done` marking.
+* `POST /job-result` (202 Accepted, enqueue to finalizer).
+* `POST /job-heartbeat`.
+* `tools/fake_plugin.py`: simulates 50 E2E batches without Photoshop.
+* `tests/test_phase3.py`.
 
-
-* Implement `tools/fake_plugin.py` and run 50 end-to-end batches completely without Photoshop.
-
-### Phase 4: Excel-Safe CSV Logging & Address Slips
-* Implement `CsvService` with Windows Excel file-lock detection, spillover buffer, and auto-draining.
-* Expose `csv_locked_warning` in `/state`.
-* Implement `PdfSlipAdapter` using `ReportLab`, `arabic-reshaper`, and `python-bidi`.
+### Phase 4: CSV, Slips & Address Book
+* `CsvService` (retry-safe, `csv_exported_at` guard, 60 s background tick).
+* `PdfSlipAdapter` (ReportLab + Amiri TTF + Arabic reshaper).
+* `config/address_book.csv` reader (doctor row wins over clinic row).
 
 ### Phase 5: Controls, Recovery & Process Watcher
-* Implement `POST /control`: `play`, `pause`, `stop`, `force_batch`, `retry`, `mark_reviewed`.
-* Implement `ProcessAdapter` watching `Photoshop.exe` via `psutil` with configurable exit grace period (30–60s).
-* Build `recovery_service.py`: Reclaim orphaned `leased` or `finalizing` batches on server boot.
+* `POST /control`: `play`, `pause`, `stop`, `force_batch`, `retry`, `mark_reviewed`, `set_after_finish`, `cancel_after_finish`.
+* `ProcessAdapter`: `psutil` Photoshop watcher + Windows power commands.
+* `RecoveryService`: reclaim `leased`/`finalizing` batches on boot.
+* Disk space check gate in `QueueService.lease()`.
+* Daily SQLite backup.
 
 ### Phase 6: Packaging & Production Hardening
-* Package into standalone executable using PyInstaller:
-  ```bash
-  pyinstaller --noconsole --name roshta-server --add-data "config.json;." app.py
-  ```
-* Verify execution on clean Windows test environment with no Python installed.
+* PyInstaller `--noconsole --onedir` with bundled Amiri TTF and `config.json` next to exe.
+* `sys.stdout`/`sys.stderr` redirected to `logs/server.log` at startup.
+* Clean-machine validation (no Python, no Node).
+
+---
+
+## 9. Failure Handling Matrix
+
+| Situation | Root Cause | Recovery |
+|---|---|---|
+| **Plugin reports error** | Corrupt PSD, disk write error | Batch → `failed`. Auto-retry once; if fails again → `flagged`, alert operator. |
+| **Lease expires** | Photoshop hung, modal dialog | `LeaseReaperDaemon` reclaims batch → `interrupted`. Temp TIFFs discarded. |
+| **Verification fails** | Corrupt TIFF, wrong dimensions | Source PSDs never moved. Temp TIFFs kept. Batch → `flagged`. |
+| **Power cut / crash** | Sudden shutdown | `RecoveryService` on boot presents Resume modal. `boot_id` change triggers plugin cache reset. |
+| **PS closed by user** | Operator finished | Grace period (30–60 s), then server exits. State safe on disk. |
+| **Pause mid-batch** | Operator clicks Pause | Current batch completes cleanly; `paused` before next lease. |
+| **File still copying (SMB)** | 150 MB PSD in flight | `open(rb)` test fails → not inserted until released. |
+| **Disk space < 5 GB** | Heavy TIFF output | Warning in `/state`, no new leases until cleared. |
+| **CSV locked by Excel** | Operator viewing log | `csv_exported_at` remains NULL, retry on next finalization or 60 s tick. |
