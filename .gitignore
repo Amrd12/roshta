@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+env/
+venv/
+*.egg-info/
+dist/
+build/
+*.db
+# Roshta Server runtime data
+server/*.db
+server/*.db-wal
+server/*.db-shm
+server/logs/
+*.token
+session.token
+csv_spillover.csv
+
+# Node & UXP
+node_modules/
+roshta ps plugin/dist/
+roshta ps plugin/node_modules/
+.DS_Store
+Thumbs.db

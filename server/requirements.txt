@@ -1,0 +1,20 @@
+# Core Web & WSGI Server
+flask>=2.3.0
+waitress>=2.1.2
+
+# Imaging & Prepress Verification
+tifffile>=2023.7.10
+pillow>=10.0.0
+numpy>=1.24.0
+
+# Process Monitoring & System Power Commands
+psutil>=5.9.5
+
+# PDF Delivery Slip & Arabic Typography
+reportlab>=4.0.4
+arabic-reshaper>=3.0.0
+python-bidi>=0.4.2
+
+# Testing & Quality Assurance
+pytest>=7.4.0
+requests>=2.31.0
