@@ -22,7 +22,7 @@ class AppConfig:
     hot_folder: str = ""
     
     # Scanner & Filename Rules
-    scan_interval_seconds: float = 2.0
+    scan_interval_seconds: float = 5.0
     file_min_age_seconds: float = 3.0
     allowed_extensions: Tuple[str, ...] = (".psd", ".psb", ".tif", ".tiff")
     doctor_regex_pattern: str = r"^(.*?)(?:[_\-\s]\d+)?\.(psd|psb|tif|tiff)$"
