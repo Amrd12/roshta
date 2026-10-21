@@ -44,28 +44,12 @@ def _finalizer():
 
 
 # ---------------------------------------------------------------------------
-# POST /lease
+# GET /next-job  (spec-compliant alias)
+# POST /lease    (legacy / internal)
 # ---------------------------------------------------------------------------
 
-@job_bp.route("/lease", methods=["POST"])
-def post_lease():
-    """
-    Lease the next ready batch.
-
-    Optional JSON body:
-        { "force": true, "clinic": "ClinicA", "paper_weight": "90gsm" }
-
-    Responses:
-        200 — job contract
-        204 — nothing ready to lease
-        409 — server paused/stopped
-        507 — disk space low
-    """
-    payload = request.get_json(silent=True) or {}
-    force        = bool(payload.get("force", False))
-    clinic       = payload.get("clinic") or None
-    paper_weight = payload.get("paper_weight") or None
-
+def _do_lease(force: bool, clinic, paper_weight):
+    """Shared logic for GET /next-job and POST /lease."""
     qs = _qs()
     try:
         contract = qs.lease_batch(force=force, clinic=clinic, paper_weight=paper_weight)
@@ -81,6 +65,50 @@ def post_lease():
         return "", 204
 
     return jsonify(contract), 200
+
+
+@job_bp.route("/next-job", methods=["GET"])
+def get_next_job():
+    """
+    Spec-compliant job request endpoint.
+
+    Query params (all optional):
+        force=1          — lease even if fewer than 4 files are ready
+        clinic=<name>    — prefer a specific clinic
+        paper_weight=<w> — prefer a specific paper weight
+
+    Responses:
+        200 — job contract
+        204 — nothing ready to lease
+        409 — server paused/stopped
+        507 — disk space low
+    """
+    force        = request.args.get("force", "0") not in ("0", "false", "")
+    clinic       = request.args.get("clinic") or None
+    paper_weight = request.args.get("paper_weight") or None
+    return _do_lease(force=force, clinic=clinic, paper_weight=paper_weight)
+
+
+@job_bp.route("/lease", methods=["POST"])
+def post_lease():
+    """
+    Lease the next ready batch (legacy / internal endpoint).
+
+    Optional JSON body:
+        { "force": true, "clinic": "ClinicA", "paper_weight": "90gsm" }
+
+    Responses:
+        200 — job contract
+        204 — nothing ready to lease
+        409 — server paused/stopped
+        507 — disk space low
+    """
+    payload = request.get_json(silent=True) or {}
+    force        = bool(payload.get("force", False))
+    clinic       = payload.get("clinic") or None
+    paper_weight = payload.get("paper_weight") or None
+    return _do_lease(force=force, clinic=clinic, paper_weight=paper_weight)
+
 
 
 # ---------------------------------------------------------------------------

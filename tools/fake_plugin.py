@@ -2,7 +2,7 @@
 tools/fake_plugin.py — Simulates the Photoshop plugin worker for E2E testing.
 
 Simulates Photoshop processing:
-  1. Requests a lease via POST /lease (with optional force=True).
+  1. Requests a lease via GET /next-job (spec-compliant endpoint).
   2. While 'rendering', sends periodic heartbeats via POST /job-heartbeat.
   3. Generates a valid output image (TIFF or JPEG) in a temporary directory.
   4. Submits the completion report via POST /job-result.
@@ -104,12 +104,14 @@ class FakePhotoshopPlugin:
             return 0, str(exc)
 
     def lease_batch(self, force: bool = False) -> Optional[Dict[str, Any]]:
-        status, data = self._http_request("/lease", method="POST", payload={"force": force})
+        """GET /next-job — spec-compliant endpoint."""
+        qs = "?force=1" if force else ""
+        status, data = self._http_request(f"/next-job{qs}", method="GET")
         if status == 200 and isinstance(data, dict):
             return data
         if status == 204:
             return None
-        logger.warning("Lease returned status %s: %s", status, data)
+        logger.warning("next-job returned status %s: %s", status, data)
         return None
 
     def send_heartbeat(self, batch_id: str, lease_id: str) -> bool:

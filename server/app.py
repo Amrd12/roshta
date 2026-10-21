@@ -10,6 +10,7 @@ from server.services.queue_service import QueueService
 from server.services.scanner_service import ScannerService
 from server.services.lease_reaper import LeaseReaperDaemon
 from server.services.finalizer_worker import JobFinalizerWorker
+from server.csv_log import make_csv_logger
 
 def create_app(custom_config: AppConfig = None) -> Flask:
     """Application factory for the Roshta Flask service."""
@@ -31,8 +32,17 @@ def create_app(custom_config: AppConfig = None) -> Flask:
     queue_service.initialise()           # stamps boot_id, builds initial snapshot
     app.config["QUEUE_SERVICE"] = queue_service
 
+    # Phase 4: CSV logger (only when finished_folder is configured)
+    csv_logger = None
+    if active_config.finished_folder:
+        csv_logger = make_csv_logger(
+            finished_folder=active_config.finished_folder,
+            log_dir=getattr(active_config, "log_dir", None),
+        )
+        app.config["CSV_LOGGER"] = csv_logger
+
     # Phase 3: Background worker threads
-    finalizer = JobFinalizerWorker(queue_service, active_config)
+    finalizer = JobFinalizerWorker(queue_service, active_config, csv_logger=csv_logger)
     finalizer.start()
     app.config["FINALIZER_WORKER"] = finalizer
 

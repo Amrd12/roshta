@@ -33,12 +33,14 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Optional
 
 from server.config import AppConfig
 from server.database import get_connection, db_transaction
 from server.adapters.filesystem_adapter import safe_move
 from server.adapters.image_verifier.factory import ImageVerifierFactory
+from server.csv_log import CsvLogger, BatchLogRow
 
 logger = logging.getLogger(__name__)
 
@@ -86,9 +88,15 @@ class JobFinalizerWorker:
         worker.stop()
     """
 
-    def __init__(self, queue_service, app_config: AppConfig) -> None:
+    def __init__(
+        self,
+        queue_service,
+        app_config: AppConfig,
+        csv_logger: Optional[CsvLogger] = None,
+    ) -> None:
         self._queue_service = queue_service
         self._config = app_config
+        self._csv_logger = csv_logger
         self._task_queue: queue.Queue[FinalizationTask] = queue.Queue()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -230,11 +238,22 @@ class JobFinalizerWorker:
         # ── Move files and finalise ──────────────────────────────────────
         try:
             self._finalise(task)
+            # CSV logging — non-fatal; a log failure must not abort the batch
+            try:
+                self._append_csv(task, status="done")
+            except Exception:
+                logger.exception(
+                    "JobFinalizerWorker: CSV logging failed for batch %s.", task.batch_id
+                )
         except Exception as exc:
             logger.exception(
                 "JobFinalizerWorker: finalise step failed for batch %s.", task.batch_id
             )
             self._mark_failed(task, reason=f"Finalisation error: {exc}")
+            try:
+                self._append_csv(task, status="failed", error=str(exc))
+            except Exception:
+                pass
         finally:
             self._rebuild_snapshot()
 
@@ -370,3 +389,64 @@ class JobFinalizerWorker:
             logger.exception("JobFinalizerWorker: failed to rebuild snapshot.")
         finally:
             conn.close()
+
+    def _append_csv(
+        self,
+        task: FinalizationTask,
+        status: str,
+        error: str = "",
+    ) -> None:
+        """
+        Append one row to the CSV logs for this batch.
+        Fetches batch metadata + slot doctor names from DB.
+        """
+        if self._csv_logger is None:
+            return
+
+        conn = get_connection(self._config.database_path)
+        try:
+            batch_row = conn.execute(
+                """
+                SELECT batch_number, clinic, paper_weight, slot_count,
+                       is_forced, duration_ms, print_final_path, tracker_final_path
+                FROM   batches
+                WHERE  id = ?;
+                """,
+                (task.batch_id,),
+            ).fetchone()
+
+            slot_rows = conn.execute(
+                """
+                SELECT doctor_name FROM batch_slots
+                WHERE  batch_id = ? AND is_empty = 0
+                ORDER BY slot;
+                """,
+                (task.batch_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        if batch_row is None:
+            logger.warning("_append_csv: batch %s not found.", task.batch_id)
+            return
+
+        doctors_str = "|".join(r["doctor_name"] for r in slot_rows)
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        csv_row = BatchLogRow(
+            timestamp=ts,
+            batch_id=task.batch_id,
+            batch_number=batch_row["batch_number"] or "",
+            clinic=batch_row["clinic"] or "",
+            paper_weight=batch_row["paper_weight"] or "",
+            slot_count=str(batch_row["slot_count"] or ""),
+            is_forced="1" if batch_row["is_forced"] else "0",
+            duration_ms=str(task.duration_ms or batch_row["duration_ms"] or ""),
+            print_final_path=batch_row["print_final_path"] or "",
+            tracker_final_path=batch_row["tracker_final_path"] or "",
+            doctors=doctors_str,
+            status=status,
+            error_message=error or task.error_message or "",
+        )
+        self._csv_logger.append_batch(csv_row)
+        logger.debug("_append_csv: logged batch %s → %s.", task.batch_id, status)
