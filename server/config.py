@@ -20,6 +20,7 @@ class AppConfig:
     source_folder: str = ""
     finished_folder: str = ""
     hot_folder: str = ""
+    disk_min_bytes: int = 5 * 1024 ** 3  # 5 GB threshold by default
     
     # Scanner & Filename Rules
     scan_interval_seconds: float = 5.0

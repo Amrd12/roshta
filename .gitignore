@@ -25,3 +25,9 @@ roshta ps plugin/dist/
 roshta ps plugin/node_modules/
 .DS_Store
 Thumbs.db
+
+
+
+input/
+.tmp/
+.sim_temp/

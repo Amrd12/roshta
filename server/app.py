@@ -5,8 +5,11 @@ from server.database import init_db
 from server.views.error_view import make_error_response
 from server.controllers.health_controller import health_bp
 from server.controllers.state_controller import state_bp
+from server.controllers.job_controller import job_bp
 from server.services.queue_service import QueueService
 from server.services.scanner_service import ScannerService
+from server.services.lease_reaper import LeaseReaperDaemon
+from server.services.finalizer_worker import JobFinalizerWorker
 
 def create_app(custom_config: AppConfig = None) -> Flask:
     """Application factory for the Roshta Flask service."""
@@ -28,15 +31,25 @@ def create_app(custom_config: AppConfig = None) -> Flask:
     queue_service.initialise()           # stamps boot_id, builds initial snapshot
     app.config["QUEUE_SERVICE"] = queue_service
 
+    # Phase 3: Background worker threads
+    finalizer = JobFinalizerWorker(queue_service, active_config)
+    finalizer.start()
+    app.config["FINALIZER_WORKER"] = finalizer
+
+    reaper = LeaseReaperDaemon(queue_service, active_config)
+    reaper.start()
+    app.config["LEASE_REAPER"] = reaper
+
     scanner = ScannerService(queue_service, active_config)
     app.config["SCANNER_SERVICE"] = scanner
-    # Only start the scanner daemon when a source folder is configured
-    if active_config.source_folder:
+    # Only start the scanner daemon when a source folder is configured and interval < 1000
+    if active_config.source_folder and 0 < active_config.scan_interval_seconds < 1000:
         scanner.start()
 
     # Register blueprints
     app.register_blueprint(health_bp)
     app.register_blueprint(state_bp)
+    app.register_blueprint(job_bp)
 
     # Token Authentication Middleware
     @app.before_request

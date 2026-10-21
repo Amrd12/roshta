@@ -44,6 +44,12 @@ class ScannerService:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._adapter: FileSystemAdapter | None = None
+        if self._config.source_folder:
+            self._adapter = FileSystemAdapter(
+                source_root=self._config.source_folder,
+                allowed_extensions=self._config.allowed_extensions,
+                doctor_regex=self._config.doctor_regex,
+            )
 
     # ------------------------------------------------------------------
     # Public API
@@ -56,11 +62,12 @@ class ScannerService:
             return
 
         self._stop_event.clear()
-        self._adapter = FileSystemAdapter(
-            source_root=self._config.source_folder,
-            allowed_extensions=self._config.allowed_extensions,
-            doctor_regex=self._config.doctor_regex,
-        )
+        if self._adapter is None and self._config.source_folder:
+            self._adapter = FileSystemAdapter(
+                source_root=self._config.source_folder,
+                allowed_extensions=self._config.allowed_extensions,
+                doctor_regex=self._config.doctor_regex,
+            )
         self._thread = threading.Thread(
             target=self._run,
             name="ScannerService",

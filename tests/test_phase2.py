@@ -59,6 +59,11 @@ def client(temp_config):
     app.config["TESTING"] = True
     with app.test_client() as c:
         yield c, temp_config
+    # Stop daemon threads so they release SQLite WAL before temp dir cleanup
+    for key in ("FINALIZER_WORKER", "LEASE_REAPER", "SCANNER_SERVICE"):
+        svc = app.config.get(key)
+        if svc and hasattr(svc, "stop"):
+            svc.stop(timeout=2.0)
 
 
 def _write_psd(folder: str, name: str, content: bytes = b"FAKE_PSD") -> str:

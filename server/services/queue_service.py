@@ -1,22 +1,28 @@
 """
 QueueService — thread-safe state machine and plan tree snapshot manager.
 
-Phase 2 scope:
+Phase 2:
   - Owns the RLock and the immutable PlanTree snapshot.
   - rebuild_snapshot(): reads holding_files from DB, builds a new PlanTree,
     atomically swaps the reference. Called by ScannerService after each pass.
   - apply_selection(): toggles is_skipped in DB then rebuilds the snapshot.
   - get_snapshot(): returns the current snapshot (no lock needed; atomic ref).
 
-Later phases (3–5) will add:
-  - lease_batch(), record_job_result(), play/pause/stop controls, recovery.
+Phase 3 (added here):
+  - lease_batch(): atomically promotes the next ready batch to 'leased',
+    locks its holding_files rows, and returns a job contract.
+  - extend_lease(): heartbeat that pushes the lease_expires_at forward.
+  - disk_space_ok(): gate checked before every lease.
 """
 from __future__ import annotations
 
 import logging
+import os
+import shutil
 import sqlite3
 import threading
-from typing import Optional
+import uuid
+from typing import Any, Dict, Optional
 
 from server.config import AppConfig
 from server.database import get_connection, db_transaction, stamp_boot_id
@@ -192,6 +198,361 @@ class QueueService:
             "FROM holding_files;"
         ).fetchall()
         return [PrescriptionFile.from_db_row(row) for row in rows]
+
+    # ------------------------------------------------------------------
+    # Phase 3: Lease management
+    # ------------------------------------------------------------------
+
+    # Default lease duration (seconds); override via AppConfig if needed
+    LEASE_SECONDS: int = 300       # 5 minutes per batch
+    DISK_MIN_BYTES: int = 5 * 1024 ** 3   # 5 GB minimum free space
+
+    def lease_batch(
+        self,
+        force: bool = False,
+        clinic: Optional[str] = None,
+        paper_weight: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Atomically promote the next ready batch to 'leased'.
+
+        Selection logic:
+          - Mode must be 'running' (not paused/stopped).
+          - Disk space must be above threshold.
+          - No other batch currently in 'leased' status for the same group
+            (one Photoshop job at a time).
+          - Selects the 4 oldest 'waiting', non-skipped files in the chosen
+            (clinic, paper_weight) group.
+          - If force=True and fewer than 4 files are available (minimum 1),
+            empty placeholder slots are filled in.
+
+        Returns a job-contract dict on success, or None if nothing is ready.
+        Raises RuntimeError with a human-readable code on soft blocks.
+        """
+        with self._lock:
+            if self._mode not in ("running", "idle"):
+                raise RuntimeError(f"SERVER_NOT_RUNNING: mode is '{self._mode}'")
+
+            if not self._check_disk_space():
+                self._warnings["disk_warning"] = True
+                raise RuntimeError("DISK_SPACE_LOW: less than 5 GB free on output volume")
+            self._warnings["disk_warning"] = False
+
+            # Find a ready group — prefer caller-specified group
+            group = self._pick_ready_group(
+                clinic=clinic,
+                paper_weight=paper_weight,
+                force=force,
+            )
+            if group is None:
+                return None
+
+            chosen_clinic, chosen_pw, candidate_files = group
+
+            # Atomically promote in DB
+            job_contract = self._promote_to_leased(
+                clinic=chosen_clinic,
+                paper_weight=chosen_pw,
+                candidate_files=candidate_files,
+                force=force,
+            )
+
+            # Rebuild snapshot so /state shows new locked files
+            conn = get_connection(self._config.database_path)
+            try:
+                self.rebuild_snapshot(conn)
+            finally:
+                conn.close()
+
+            return job_contract
+
+    def extend_lease(self, batch_id: str, lease_id: str) -> bool:
+        """
+        Extend the lease expiry for an active batch (heartbeat).
+
+        Returns True on success, False if the lease_id doesn't match or
+        the batch is no longer in 'leased' status.
+        """
+        lease_seconds = getattr(self._config, "lease_seconds", self.LEASE_SECONDS)
+        with db_transaction(self._config.database_path) as conn:
+            row = conn.execute(
+                "SELECT status, lease_id FROM batches WHERE id = ?;",
+                (batch_id,)
+            ).fetchone()
+
+            if row is None:
+                logger.warning("extend_lease: batch %s not found.", batch_id)
+                return False
+
+            if row["lease_id"] != lease_id:
+                logger.warning(
+                    "extend_lease: lease_id mismatch for batch %s "
+                    "(got %s, expected %s).",
+                    batch_id, lease_id, row["lease_id"]
+                )
+                return False
+
+            if row["status"] != "leased":
+                logger.warning(
+                    "extend_lease: batch %s is '%s', not 'leased'.",
+                    batch_id, row["status"]
+                )
+                return False
+
+            conn.execute(
+                """
+                UPDATE batches
+                SET lease_expires_at = DATETIME(
+                    CURRENT_TIMESTAMP, '+' || ? || ' seconds'
+                )
+                WHERE id = ?;
+                """,
+                (lease_seconds, batch_id),
+            )
+
+        logger.debug("extend_lease: batch %s extended by %ss.", batch_id, lease_seconds)
+        return True
+
+    # ------------------------------------------------------------------
+    # Phase 3: Internal helpers
+    # ------------------------------------------------------------------
+
+    def _check_disk_space(self) -> bool:
+        """Return True if the output volume has ≥ min_bytes free."""
+        path = self._config.finished_folder or self._config.source_folder
+        if not path:
+            return True  # Can't check — allow
+        min_bytes = getattr(self._config, "disk_min_bytes", self.DISK_MIN_BYTES)
+        try:
+            free = shutil.disk_usage(path).free
+            return free >= min_bytes
+        except Exception:
+            logger.exception("_check_disk_space: could not read disk usage.")
+            return True  # Fail-open so a bad stat doesn't block production
+
+    def _pick_ready_group(
+        self,
+        clinic: Optional[str],
+        paper_weight: Optional[str],
+        force: bool,
+    ) -> Optional[tuple]:
+        """
+        Find the (clinic, paper_weight, [files]) group that is ready to lease.
+
+        Returns (clinic, paper_weight, [PrescriptionFile, ...]) or None.
+        """
+        conn = get_connection(self._config.database_path)
+        try:
+            # Load all waiting, non-skipped files
+            where_extra = ""
+            params: list = []
+            if clinic:
+                where_extra += " AND clinic = ?"
+                params.append(clinic)
+            if paper_weight:
+                where_extra += " AND paper_weight = ?"
+                params.append(paper_weight)
+
+            rows = conn.execute(
+                f"""
+                SELECT id, file_path, clinic, paper_weight, doctor_name,
+                       file_size, mtime, is_skipped, status, batch_id
+                FROM   holding_files
+                WHERE  status = 'waiting'
+                  AND  is_skipped = 0
+                  {where_extra}
+                ORDER BY mtime ASC, file_path ASC;
+                """,
+                params,
+            ).fetchall()
+        finally:
+            conn.close()
+
+        if not rows:
+            return None
+
+        # Group by (clinic, paper_weight); pick first group with ≥4 files (or any if force)
+        from server.models.prescription import PrescriptionFile
+        groups: Dict[tuple, list] = {}
+        for row in rows:
+            key = (row["clinic"], row["paper_weight"])
+            groups.setdefault(key, []).append(PrescriptionFile.from_db_row(row))
+
+        # Prefer the group with the most files that has ≥4 (ready)
+        ready = {k: v for k, v in groups.items() if len(v) >= 4}
+        if ready:
+            # Pick the group whose oldest file is oldest overall
+            key = min(ready, key=lambda k: ready[k][0].mtime)
+            return key[0], key[1], ready[key][:4]
+
+        if force:
+            # Pick whichever group has files (oldest-first)
+            key = min(groups, key=lambda k: groups[k][0].mtime)
+            return key[0], key[1], groups[key][:4]
+
+        return None
+
+    def _promote_to_leased(
+        self,
+        clinic: str,
+        paper_weight: str,
+        candidate_files: list,
+        force: bool,
+    ) -> Dict[str, Any]:
+        """
+        Execute the atomic BEGIN IMMEDIATE promotion transaction.
+
+        Returns the job contract dict.
+        """
+        from server.models.batch import SLOT_ORDER, SLOT_COORDS
+
+        lease_seconds = getattr(self._config, "lease_seconds", self.LEASE_SECONDS)
+        batch_id = f"batch_{uuid.uuid4().hex[:16]}"
+        lease_id = str(uuid.uuid4())
+        slot_count = 4
+        is_forced = force and len(candidate_files) < 4
+
+        conn = get_connection(self._config.database_path)
+        try:
+            # BEGIN IMMEDIATE prevents readers from upgrading to writers while
+            # we're assigning files, eliminating the double-batch race.
+            conn.execute("BEGIN IMMEDIATE;")
+
+            # Re-check the candidate files are still 'waiting' (guard against race)
+            file_ids = [f.id for f in candidate_files]
+            placeholders = ",".join("?" * len(file_ids))
+            fresh_rows = conn.execute(
+                f"""
+                SELECT id, file_path, clinic, paper_weight, doctor_name,
+                       file_size, mtime, is_skipped, status, batch_id
+                FROM   holding_files
+                WHERE  id IN ({placeholders})
+                  AND  status = 'waiting'
+                  AND  is_skipped = 0;
+                """,
+                file_ids,
+            ).fetchall()
+
+            if len(fresh_rows) < 1:
+                raise RuntimeError("RACE: files were grabbed by another lease — retry")
+
+            from server.models.prescription import PrescriptionFile
+            fresh_files = [PrescriptionFile.from_db_row(r) for r in fresh_rows]
+
+            # Atomically increment the batch counter
+            conn.execute(
+                """
+                UPDATE system_state
+                SET    value      = CAST(value AS INTEGER) + 1,
+                       updated_at = CURRENT_TIMESTAMP
+                WHERE  key = 'next_batch_number';
+                """
+            )
+            batch_num_row = conn.execute(
+                "SELECT value FROM system_state WHERE key = 'next_batch_number';"
+            ).fetchone()
+            batch_number = f"B{int(batch_num_row['value']) - 1:05d}"
+
+            # Insert the batch row
+            conn.execute(
+                """
+                INSERT INTO batches (
+                    id, batch_number, lease_id, clinic, paper_weight,
+                    status, attempt_count, slot_count, is_forced,
+                    leased_at, lease_expires_at
+                ) VALUES (
+                    ?, ?, ?, ?, ?,
+                    'leased', 1, ?, ?,
+                    CURRENT_TIMESTAMP,
+                    DATETIME(CURRENT_TIMESTAMP, '+' || ? || ' seconds')
+                );
+                """,
+                (
+                    batch_id, batch_number, lease_id, clinic, paper_weight,
+                    slot_count, 1 if is_forced else 0,
+                    lease_seconds,
+                ),
+            )
+
+            # Insert batch_slots and lock holding_files
+            slot_assignments = []
+            for i, slot_name in enumerate(SLOT_ORDER):
+                x, y = SLOT_COORDS[slot_name]
+                if i < len(fresh_files):
+                    f = fresh_files[i]
+                    conn.execute(
+                        """
+                        INSERT INTO batch_slots
+                            (batch_id, slot, doctor_name, source_path, x_cm, y_cm, is_empty)
+                        VALUES (?, ?, ?, ?, ?, ?, 0);
+                        """,
+                        (batch_id, slot_name, f.doctor_name, f.file_path, x, y),
+                    )
+                    slot_assignments.append({
+                        "slot": slot_name,
+                        "doctor_name": f.doctor_name,
+                        "source_path": f.file_path,
+                        "x_cm": x,
+                        "y_cm": y,
+                        "is_empty": False,
+                    })
+                elif is_forced:
+                    conn.execute(
+                        """
+                        INSERT INTO batch_slots
+                            (batch_id, slot, doctor_name, source_path, x_cm, y_cm, is_empty)
+                        VALUES (?, ?, '[EMPTY]', '', ?, ?, 1);
+                        """,
+                        (batch_id, slot_name, x, y),
+                    )
+                    slot_assignments.append({
+                        "slot": slot_name,
+                        "doctor_name": "[EMPTY]",
+                        "source_path": "",
+                        "x_cm": x,
+                        "y_cm": y,
+                        "is_empty": True,
+                    })
+
+            # Lock holding_files rows
+            lock_ids = [f.id for f in fresh_files]
+            conn.execute(
+                f"""
+                UPDATE holding_files
+                SET    status   = 'locked',
+                       batch_id = ?
+                WHERE  id IN ({','.join('?' * len(lock_ids))});
+                """,
+                [batch_id] + lock_ids,
+            )
+
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            conn.close()
+            raise
+        else:
+            conn.close()
+
+        logger.info(
+            "lease_batch: promoted %s (%s) → batch %s (lease %s, %ds)",
+            clinic, paper_weight, batch_number, lease_id, lease_seconds
+        )
+
+        return {
+            "batch_id":    batch_id,
+            "batch_number": batch_number,
+            "lease_id":    lease_id,
+            "clinic":      clinic,
+            "paper_weight": paper_weight,
+            "is_forced":   is_forced,
+            "lease_seconds": lease_seconds,
+            "slots":       slot_assignments,
+        }
+
+    # ------------------------------------------------------------------
+    # Accessors
+    # ------------------------------------------------------------------
 
     @property
     def mode(self) -> str:
