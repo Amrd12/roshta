@@ -565,3 +565,209 @@ class QueueService:
     @property
     def boot_id(self) -> str:
         return self._boot_id
+
+    # ------------------------------------------------------------------
+    # Phase 5: Queue control
+    # ------------------------------------------------------------------
+
+    def set_mode(self, new_mode: str) -> str:
+        """
+        Transition the queue mode.
+
+        Allowed transitions:
+            idle/paused/stopped  → running   (play)
+            running              → pausing   (pause — waits for current batch)
+            pausing/running/idle → stopped   (stop)
+            pausing              → paused    (internal: set by finalizer after batch done)
+
+        Returns the resulting mode string.
+        Raises ValueError for illegal transitions.
+        """
+        valid_transitions: Dict[str, list] = {
+            "play":   {"idle", "paused", "stopped", "pausing"},
+            "pause":  {"running"},
+            "stop":   {"running", "pausing", "paused", "idle"},
+            "paused": {"pausing"},  # internal: finalizer calls after last batch drains
+        }
+        new_mode_map = {
+            "play":   "running",
+            "pause":  "pausing",
+            "stop":   "stopped",
+            "paused": "paused",
+        }
+
+        with self._lock:
+            if new_mode not in new_mode_map:
+                raise ValueError(f"Unknown mode command: '{new_mode}'")
+            if self._mode not in valid_transitions[new_mode]:
+                raise ValueError(
+                    f"Cannot '{new_mode}' from mode '{self._mode}'. "
+                    f"Allowed from: {sorted(valid_transitions[new_mode])}"
+                )
+            self._mode = new_mode_map[new_mode]
+            logger.info("QueueService: mode → '%s' (via command '%s')", self._mode, new_mode)
+
+            # Rebuild snapshot so /state immediately reflects the new mode
+            conn = get_connection(self._config.database_path)
+            try:
+                self.rebuild_snapshot(conn)
+            finally:
+                conn.close()
+
+        return self._mode
+
+    def retry_batch(self, batch_id: str) -> bool:
+        """
+        Re-queue a batch that is in a terminal error state
+        ('failed', 'interrupted', or 'flagged') back to 'waiting'.
+
+        Returns True on success, False if the batch is not found or is
+        not in a retryable state.
+        """
+        RETRYABLE = ("failed", "interrupted", "flagged")
+
+        with self._lock:
+            with db_transaction(self._config.database_path) as conn:
+                row = conn.execute(
+                    "SELECT status FROM batches WHERE id = ?;",
+                    (batch_id,)
+                ).fetchone()
+
+                if row is None:
+                    logger.warning("retry_batch: batch %s not found.", batch_id)
+                    return False
+
+                if row["status"] not in RETRYABLE:
+                    logger.warning(
+                        "retry_batch: batch %s in status '%s' is not retryable.",
+                        batch_id, row["status"]
+                    )
+                    return False
+
+                # Increment attempt counter, reset status
+                conn.execute(
+                    """
+                    UPDATE batches
+                    SET    status        = 'interrupted',
+                           error_message = NULL,
+                           completed_at  = NULL
+                    WHERE  id = ?;
+                    """,
+                    (batch_id,)
+                )
+
+                # Return holding_files to 'waiting' pool
+                conn.execute(
+                    """
+                    UPDATE holding_files
+                    SET    status   = 'waiting',
+                           batch_id = NULL
+                    WHERE  batch_id = ?;
+                    """,
+                    (batch_id,)
+                )
+
+            conn2 = get_connection(self._config.database_path)
+            try:
+                self.rebuild_snapshot(conn2)
+            finally:
+                conn2.close()
+
+        logger.info("retry_batch: batch %s returned to waiting pool.", batch_id)
+        return True
+
+    def mark_reviewed(self, batch_id: str) -> bool:
+        """
+        Acknowledge a 'flagged' batch without retrying it — marks it 'done'
+        so it no longer appears as an error requiring operator attention.
+
+        Returns True on success, False if not found or not flagged.
+        """
+        with self._lock:
+            with db_transaction(self._config.database_path) as conn:
+                row = conn.execute(
+                    "SELECT status FROM batches WHERE id = ?;",
+                    (batch_id,)
+                ).fetchone()
+
+                if row is None or row["status"] != "flagged":
+                    logger.warning(
+                        "mark_reviewed: batch %s not found or not 'flagged' (status=%s).",
+                        batch_id, row["status"] if row else "NOT_FOUND"
+                    )
+                    return False
+
+                conn.execute(
+                    """
+                    UPDATE batches
+                    SET    status       = 'done',
+                           error_message = NULL,
+                           completed_at  = CURRENT_TIMESTAMP
+                    WHERE  id = ?;
+                    """,
+                    (batch_id,)
+                )
+
+            conn2 = get_connection(self._config.database_path)
+            try:
+                self.rebuild_snapshot(conn2)
+            finally:
+                conn2.close()
+
+        logger.info("mark_reviewed: batch %s cleared as reviewed.", batch_id)
+        return True
+
+    def get_resume_summary(self) -> Dict[str, Any]:
+        """
+        Query the DB for batches that survived a crash/restart and need
+        operator attention.
+
+        Returns a dict used by GET /health:
+            {
+              "interrupted_batches": N,
+              "leased_batches":      N,   # leased at last shutdown — probably stale
+              "flagged_batches":     N,
+              "recommendation":      "auto_restart" | "flag_for_review" | "none"
+            }
+
+        Logic:
+          - flagged > 0  → "flag_for_review" (needs human eyes)
+          - interrupted > 0 or leased > 0 → "auto_restart" (safe to re-queue)
+          - otherwise → "none"
+        """
+        conn = get_connection(self._config.database_path)
+        try:
+            row = conn.execute(
+                """
+                SELECT
+                  SUM(CASE WHEN status='interrupted' THEN 1 ELSE 0 END) AS interrupted,
+                  SUM(CASE WHEN status='leased'      THEN 1 ELSE 0 END) AS leased,
+                  SUM(CASE WHEN status='flagged'     THEN 1 ELSE 0 END) AS flagged
+                FROM batches;
+                """
+            ).fetchone()
+            h_row = conn.execute(
+                "SELECT COUNT(*) AS count FROM holding_files;"
+            ).fetchone()
+        finally:
+            conn.close()
+
+        interrupted = int(row["interrupted"] or 0) if row else 0
+        leased      = int(row["leased"]      or 0) if row else 0
+        flagged     = int(row["flagged"]     or 0) if row else 0
+        holding     = int(h_row["count"]     or 0) if h_row else 0
+
+        if flagged > 0:
+            recommendation = "flag_for_review"
+        elif interrupted > 0 or leased > 0:
+            recommendation = "auto_restart"
+        else:
+            recommendation = "none"
+
+        return {
+            "interrupted_batches": interrupted,
+            "leased_batches":      leased,
+            "flagged_batches":     flagged,
+            "holding_files":       holding,
+            "recommendation":      recommendation,
+        }

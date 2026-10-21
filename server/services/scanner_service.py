@@ -96,6 +96,9 @@ class ScannerService:
         self._stop_event.clear() # Re-arm for next iteration
         logger.info("ScannerService: forced rescan triggered.")
 
+    # Alias used by control_controller
+    trigger_scan = trigger_rescan
+
     # ------------------------------------------------------------------
     # Background loop
     # ------------------------------------------------------------------

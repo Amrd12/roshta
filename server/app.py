@@ -6,6 +6,7 @@ from server.views.error_view import make_error_response
 from server.controllers.health_controller import health_bp
 from server.controllers.state_controller import state_bp
 from server.controllers.job_controller import job_bp
+from server.controllers.control_controller import control_bp
 from server.services.queue_service import QueueService
 from server.services.scanner_service import ScannerService
 from server.services.lease_reaper import LeaseReaperDaemon
@@ -60,6 +61,7 @@ def create_app(custom_config: AppConfig = None) -> Flask:
     app.register_blueprint(health_bp)
     app.register_blueprint(state_bp)
     app.register_blueprint(job_bp)
+    app.register_blueprint(control_bp)
 
     # Token Authentication Middleware
     @app.before_request

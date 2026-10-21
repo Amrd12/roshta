@@ -1,15 +1,25 @@
+"""
+HealthController — GET /health endpoint.
+
+Returns service vitality, Photoshop process status, queue mode, disk
+space, and a resume summary with an Auto-Restart / Flag-for-Review
+recommendation based on DB batch states from the previous run.
+"""
+from __future__ import annotations
+
+import shutil
 import time
+
 import psutil
-from flask import Blueprint
-from server.database import get_connection
-from server.views.health_view import make_health_response
+from flask import Blueprint, current_app, jsonify
 
 health_bp = Blueprint("health", __name__)
 SERVER_START_TIME = time.time()
 SERVER_VERSION = "2.0.0"
 
-def is_photoshop_running() -> bool:
-    """Checks if Photoshop.exe is currently present in running processes."""
+
+def _is_photoshop_running() -> bool:
+    """Return True if Photoshop.exe is present in the running process list."""
     try:
         for proc in psutil.process_iter(["name"]):
             name = proc.info.get("name")
@@ -19,48 +29,70 @@ def is_photoshop_running() -> bool:
         pass
     return False
 
+
+def _disk_free_gb(path: str) -> float:
+    """Return free disk space in GB for the volume containing *path*."""
+    try:
+        return shutil.disk_usage(path).free / 1024 ** 3
+    except Exception:
+        return -1.0
+
+
 @health_bp.route("/health", methods=["GET"])
 def health_check():
-    """GET /health - Verifies service status, uptime, PS status, and uncommitted crash recovery counts."""
+    """
+    GET /health — open endpoint (no X-Token required).
+
+    Response fields:
+        status              "ok" | "degraded"
+        version             Server version string
+        uptime_seconds      Seconds since server start
+        mode                Current queue mode
+        photoshop_running   True if Photoshop.exe detected
+        database            "connected" | "error"
+        disk_free_gb        Free GB on finished_folder volume (-1 if unknown)
+        disk_warning        True when free space < threshold
+        resume_summary      { interrupted_batches, leased_batches,
+                              flagged_batches, recommendation }
+    """
     uptime = time.time() - SERVER_START_TIME
-    ps_running = is_photoshop_running()
-    
-    interrupted_count = 0
-    leased_count = 0
-    holding_count = 0
+    ps_running = _is_photoshop_running()
     db_ok = True
+    resume_summary = {
+        "interrupted_batches": 0,
+        "leased_batches": 0,
+        "flagged_batches": 0,
+        "holding_files": 0,
+        "recommendation": "none",
+    }
+    mode = "idle"
+    disk_free_gb = -1.0
+    disk_warning = False
 
     try:
-        conn = get_connection()
-        try:
-            # Query recovery summary
-            row = conn.execute(
-                "SELECT "
-                "SUM(CASE WHEN status = 'interrupted' THEN 1 ELSE 0 END) as interrupted, "
-                "SUM(CASE WHEN status = 'leased' THEN 1 ELSE 0 END) as leased "
-                "FROM batches"
-            ).fetchone()
-            if row:
-                interrupted_count = row["interrupted"] or 0
-                leased_count = row["leased"] or 0
+        qs = current_app.config.get("QUEUE_SERVICE")
+        if qs is not None:
+            mode = qs.mode
+            resume_summary = qs.get_resume_summary()
+            disk_warning = qs._warnings.get("disk_warning", False)
 
-            # Query staging count
-            h_row = conn.execute("SELECT COUNT(*) as count FROM holding_files").fetchone()
-            if h_row:
-                holding_count = h_row["count"] or 0
-        finally:
-            conn.close()
-    except Exception as e:
+        cfg = current_app.config.get("APP_CONFIG")
+        if cfg and cfg.finished_folder:
+            disk_free_gb = _disk_free_gb(cfg.finished_folder)
+    except Exception:
         import logging
-        logging.getLogger("health").warning(f"Health DB query failed: {e}")
+        logging.getLogger("health").exception("Health check query failed.")
         db_ok = False
 
-    return make_health_response(
-        version=SERVER_VERSION,
-        uptime_seconds=uptime,
-        photoshop_running=ps_running,
-        db_connected=db_ok,
-        interrupted_batches=interrupted_count,
-        leased_batches=leased_count,
-        holding_files_count=holding_count
-    )
+    payload = {
+        "status": "ok" if db_ok else "degraded",
+        "version": SERVER_VERSION,
+        "uptime_seconds": round(uptime, 1),
+        "mode": mode,
+        "photoshop_running": ps_running,
+        "database": "connected" if db_ok else "error",
+        "disk_free_gb": round(disk_free_gb, 2),
+        "disk_warning": disk_warning,
+        "resume_summary": resume_summary,
+    }
+    return jsonify(payload), (200 if db_ok else 503)
