@@ -233,34 +233,35 @@ When processing 100+ large batches in an overnight run, Photoshop RAM and scratc
 * **UXP Spike A:** Validate manifest permissions (`fullAccess`, loopback network).
 * **UXP Spike B:** Run a minimal script in Photoshop to place 4 PSDs via BatchPlay `placeEvent`, save TIFFs with LZW, and verify speed and memory behavior.
 
-### Phase 1: Server Skeleton & Security
+### Phase 1: Server Skeleton & Security ✅ DONE
 * Headless Flask application binding strictly to `127.0.0.1`.
 * Token verification (`X-Token`), handshake file generation, rotating file logger.
 * Windows named mutex single-instance guard.
 * Photoshop process watcher using `psutil` with configurable exit grace period.
 
-### Phase 2: Scanner, Plan Tree & State Engine
+### Phase 2: Scanner, Plan Tree & State Engine ✅ DONE
 * Polling engine with two-tier stability check (size check + exclusive file lock).
 * Path parsing: clinic, paper weight, and doctor name extraction with suffix stripping.
 * Plan tree builder with grouping and provisional batch assignment.
-* Atomic `session_state.json` store (write temp -> rename).
+* Atomic SQLite WAL store + in-memory plan tree snapshot.
 
-### Phase 3: Selection & Tree Mutation
+### Phase 3: Selection & Tree Mutation ✅ DONE
 * Implement `POST /selection` with revision tracking (`rev`).
 * Exclusion rules engine (skip files/folders by path and metadata).
 * Lock checks (`423 Locked`) for running batches and `409 Conflict` for stale revisions.
 
-### Phase 4: Job Engine & Fake Worker Simulation
-* Build `fake_plugin.py` to simulate Photoshop: fetches `/next-job`, delays, creates dummy TIFFs, and posts `/job-result`.
-* Real batch numbering counter with disk persistence.
-* Lease timer manager and expiration handler.
+### Phase 4: Job Engine & Fake Worker Simulation ✅ DONE
+* Build `fake_plugin.py` to simulate Photoshop: fetches `/next-job` / `/lease`, delays, creates dummy TIFFs, and posts `/job-result`.
+* Real batch numbering counter with disk persistence (`B00001`+).
+* Lease timer manager and expiration handler (`LeaseReaperDaemon`).
 * Verification engine (`tifffile`/Pillow), atomic file rename, source moving, and CSV logger.
-* **Exit criteria:** The complete server pipeline runs end-to-end against the fake worker, including crash simulation.
+* Exit criteria met: E2E pipeline simulated and verified.
 
-### Phase 5: Queue Control & Recovery Protocols
-* Implement `play`, `pause`, `stop`, `force_batch`, `retry`, and `mark_reviewed` in `POST /control`.
-* Disk space threshold monitor.
-* Resume summary logic in `/health` (Auto-Restart vs. Flag for Review).
+### Phase 5: Queue Control & Recovery Protocols ✅ DONE
+* Implement `play`, `pause`, `stop`, `force_batch`, `retry`, `mark_reviewed`, and `rescan` in `POST /control`.
+* Disk space threshold monitor gate in `QueueService.lease()`.
+* Resume summary logic & recommendations in `/health` (Auto-Restart vs. Flag for Review).
+* All 154 unit and integration tests passing (`pytest tests/`).
 
 ### Phase 6: After-Finishing Module
 * Delayed Windows system commands (`shutdown`, `lock`, `sleep`, `hibernate`) with abort capability.

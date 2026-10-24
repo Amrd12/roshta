@@ -1,38 +1,72 @@
 import React from "react";
 import ReactDOM from "react-dom";
 
-import "./styles.css";
+import "./ui/styles.css";
 import { PanelController } from "./controllers/PanelController.jsx";
-import { CommandController } from "./controllers/CommandController.jsx";
-import { About } from "./components/About.jsx";
-import { Demos } from "./panels/Demos.jsx";
-import { MoreDemos } from "./panels/MoreDemos.jsx";
+import { App } from "./ui/App.jsx";
+import { pauseCommand } from "./commands/pause.js";
+import { resumeCommand } from "./commands/resume.js";
+import { afterFinishCommand } from "./commands/afterFinish.js";
 
+import { loadConfig } from "./core/config.js";
+import { poller } from "./core/poller.js";
+import { store, A } from "./core/store.js";
 import { entrypoints } from "uxp";
 
-const aboutController = new CommandController(({ dialog }) => <About dialog={dialog}/>, { id: "showAbout", title: "React Starter Plugin Demo", size: { width: 480, height: 480 } });
-const demosController =  new PanelController(() => <Demos/>, { id: "demos", menuItems: [
-    { id: "reload1", label: "Reload Plugin", enabled: true, checked: false, oninvoke: () => location.reload() },
-    { id: "dialog1", label: "About this Plugin", enabled: true, checked: false, oninvoke: () => aboutController.run() },
-] });
-const moreDemosController =  new PanelController(() => <MoreDemos/>, { id: "moreDemos", menuItems: [
-    { id: "reload2", label: "Reload Plugin", enabled: true, checked: false, oninvoke: () => location.reload() }
-] });
+const mainPanelController = new PanelController(() => <App />, {
+    id: "roshta-main",
+    menuItems: [
+        { id: "reload", label: "Reload Plugin", enabled: true, checked: false, oninvoke: () => location.reload() },
+        {
+            id: "show-setup",
+            label: "Settings…",
+            enabled: true,
+            checked: false,
+            oninvoke: () => {
+                store.dispatch({ type: A.SET_ACTIVE_TAB, payload: "setup" });
+            }
+        }
+    ]
+});
+
+const pauseController = { run: pauseCommand };
+const resumeController = { run: resumeCommand };
+const afterFinishController = { run: afterFinishCommand };
 
 entrypoints.setup({
     plugin: {
-        create(plugin) {
-            /* optional */ console.log("created", plugin);
+        async create(plugin) {
+            console.log("[Roshta] Plugin lifecycle: create", plugin);
+            try {
+                const config = await loadConfig();
+                store.dispatch({ type: A.SET_SETTINGS, payload: config });
+            } catch (err) {
+                console.warn("[Roshta] Error loading config on plugin create:", err);
+            }
+            poller.start();
         },
         destroy() {
-            /* optional */ console.log("destroyed");
+            console.log("[Roshta] Plugin lifecycle: destroy");
+            poller.stop();
         }
     },
-    commands: {
-        showAbout: aboutController
-    },
     panels: {
-        demos: demosController,
-        moreDemos: moreDemosController
+        "roshta-main": mainPanelController
+    },
+    commands: {
+        "cmd-pause": pauseController,
+        "cmd-resume": resumeController,
+        "cmd-after-finish": afterFinishController
     }
 });
+
+// Self-initialize immediately on script load
+(async function init() {
+    try {
+        const config = await loadConfig();
+        store.dispatch({ type: A.SET_SETTINGS, payload: config });
+    } catch (e) {
+        console.warn("[Roshta] Immediate config load notice:", e);
+    }
+    poller.start();
+})();

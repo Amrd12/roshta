@@ -2,15 +2,11 @@ import React from "react";
 import ReactDOM from "react-dom";
 
 export class CommandController {
-    #id = null;
-    #root = null;
-    #Component = null;
-    #dialogOpts = {};
-
     constructor(Component, { id, ...dialogOpts } = {}) {
-        this.#Component = Component;
-        this.#id = id;
-        this.#dialogOpts = Object.assign({}, {
+        this._Component = Component;
+        this._id = id;
+        this._root = null;
+        this._dialogOpts = Object.assign({}, {
             title: id,
             resize: "none",
             size: {
@@ -22,13 +18,13 @@ export class CommandController {
     }
 
     async run() {
-        if (!this.#root) {
-            this.#root = document.createElement("dialog");
-            ReactDOM.render(this.#Component({ dialog: this.#root }), this.#root);
+        if (!this._root) {
+            this._root = document.createElement("dialog");
+            ReactDOM.render(this._Component({ dialog: this._root }), this._root);
         }
-        document.body.appendChild(this.#root);
+        document.body.appendChild(this._root);
 
-        await this.#root.showModal(this.#dialogOpts);
-        this.#root.remove();
+        await this._root.showModal(this._dialogOpts);
+        this._root.remove();
     }
 }

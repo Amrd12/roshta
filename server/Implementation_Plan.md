@@ -481,33 +481,36 @@ If the plugin receives a different `boot_id` than what it cached, it treats the 
 * `GET /health` endpoint.
 * All tests passing in `tests/test_phase1.py`.
 
-### Phase 2: Staging Queue & Non-Blocking Scanner
+### Phase 2: Staging Queue & Non-Blocking Scanner ✅ DONE
 * `FileSystemAdapter`: 5 s snapshot diff, two-tier stability, `safe_move`.
 * `ScannerService` daemon.
 * `PlanTree` in-memory builder with `rev`.
 * `GET /state?rev=N` (served from immutable snapshot).
 * `POST /selection` (toggles `is_skipped` in SQLite).
-* `tests/test_phase2.py`.
+* All tests passing in `tests/test_phase2.py`.
 
-### Phase 3: Atomic Lease & Fake Worker Validation
+### Phase 3: Atomic Lease & Fake Worker Validation ✅ DONE
 * `QueueService` with `POST /lease`, lease timer, `LeaseReaperDaemon`.
 * `JobFinalizerWorker`: TIFF verify, `safe_move`, CSV, slip, `done` marking.
 * `POST /job-result` (202 Accepted, enqueue to finalizer).
 * `POST /job-heartbeat`.
 * `tools/fake_plugin.py`: simulates 50 E2E batches without Photoshop.
-* `tests/test_phase3.py`.
+* All tests passing in `tests/test_phase3.py`.
 
-### Phase 4: CSV, Slips & Address Book
+### Phase 4: CSV, Slips & Address Book ✅ DONE
 * `CsvService` (retry-safe, `csv_exported_at` guard, 60 s background tick).
 * `PdfSlipAdapter` (ReportLab + Amiri TTF + Arabic reshaper).
 * `config/address_book.csv` reader (doctor row wins over clinic row).
+* Sequential permanent batch numbering (`B00001`+).
+* All tests passing in `tests/test_phase4.py`.
 
-### Phase 5: Controls, Recovery & Process Watcher
-* `POST /control`: `play`, `pause`, `stop`, `force_batch`, `retry`, `mark_reviewed`, `set_after_finish`, `cancel_after_finish`.
+### Phase 5: Controls, Recovery & Process Watcher ✅ DONE
+* `POST /control`: `play`, `pause`, `stop`, `force_batch`, `retry`, `mark_reviewed`, `rescan`, `set_after_finish`, `cancel_after_finish`.
+* State machine & snapshot: mode tracking (`idle`, `running`, `paused`, `stopped`).
 * `ProcessAdapter`: `psutil` Photoshop watcher + Windows power commands.
-* `RecoveryService`: reclaim `leased`/`finalizing` batches on boot.
-* Disk space check gate in `QueueService.lease()`.
-* Daily SQLite backup.
+* `RecoveryService`: resume summary & recommendations (`auto_restart` vs `flag_for_review`).
+* Disk space threshold monitor gate in `QueueService.lease()`.
+* All tests passing in `tests/test_phase5.py` (154/154 total test suite passing).
 
 ### Phase 6: Packaging & Production Hardening
 * PyInstaller `--noconsole --onedir` with bundled Amiri TTF and `config.json` next to exe.

@@ -1,0 +1,248 @@
+/* ─────────────────────────────────────────────────────────────────────────
+   Roshta Plugin — Global Styles
+   Uses UXP host CSS variables so the panel follows Photoshop's theme.
+   ───────────────────────────────────────────────────────────────────────── */
+
+/* ── Reset ─────────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+/* ── UXP host colour tokens (fallbacks for dev outside Photoshop) ────────
+   UXP exposes these on :root automatically in Photoshop.
+   We alias them to our own tokens so components stay readable.           */
+:root {
+  --roshta-bg:          var(--uxp-host-background-color,      #2b2b2b);
+  --roshta-bg-raised:   var(--uxp-host-widget-hover-color,    #333333);
+  --roshta-bg-sunken:   var(--uxp-host-background-color,      #1e1e1e);
+  --roshta-surface:     var(--uxp-host-panel-background-color,#292929);
+  --roshta-border:      var(--uxp-host-border-color,          #444444);
+  --roshta-text:        var(--uxp-host-text-color,            #e0e0e0);
+  --roshta-text-muted:  var(--uxp-host-label-color,           #999999);
+  --roshta-text-dim:    var(--uxp-host-label-color,           #666666);
+  --roshta-accent:      #4a90d9;
+  --roshta-accent-hover:#6aaef0;
+  --roshta-danger:      #e05c5c;
+  --roshta-warning:     #d4993a;
+  --roshta-success:     #5ca95c;
+  --roshta-radius:      4px;
+  --roshta-radius-sm:   2px;
+  --roshta-space-xs:    4px;
+  --roshta-space-sm:    8px;
+  --roshta-space-md:    12px;
+  --roshta-space-lg:    16px;
+  --roshta-font:        var(--uxp-host-font-family, "Adobe Clean", "Segoe UI", sans-serif);
+  --roshta-font-size:   var(--uxp-host-font-size,   12px);
+  --roshta-font-sm:     11px;
+}
+
+/* ── Base ───────────────────────────────────────────────────────────────── */
+body, #root {
+  background:  var(--roshta-bg);
+  color:       var(--roshta-text);
+  font-family: var(--roshta-font);
+  font-size:   var(--roshta-font-size);
+  line-height: 1.4;
+  height:      100%;
+  overflow:    hidden;
+}
+
+/* ── Layout shell ───────────────────────────────────────────────────────── */
+.r-shell {
+  display:        flex;
+  flex-direction: column;
+  height:         100vh;
+  overflow:       hidden;
+}
+
+/* Tab bar */
+.r-tab-bar {
+  display:     flex;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--roshta-border);
+  background:  var(--roshta-bg-sunken);
+}
+.r-tab-bar button {
+  flex: 1;
+  padding:     var(--roshta-space-sm) var(--roshta-space-sm);
+  background:  transparent;
+  border:      none;
+  border-bottom: 2px solid transparent;
+  color:       var(--roshta-text-muted);
+  font-size:   var(--roshta-font-sm);
+  cursor:      pointer;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.r-tab-bar button.active {
+  color:       var(--roshta-text);
+  border-bottom-color: var(--roshta-accent);
+}
+.r-tab-bar button:hover:not(.active) {
+  color:       var(--roshta-text);
+  background:  var(--roshta-bg-raised);
+}
+
+/* Panel content area */
+.r-panel {
+  flex:     1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding:  var(--roshta-space-sm);
+}
+
+/* ── Banners ─────────────────────────────────────────────────────────────── */
+.r-banner {
+  display:  flex;
+  align-items: center;
+  gap:      var(--roshta-space-sm);
+  padding:  var(--roshta-space-xs) var(--roshta-space-sm);
+  font-size: var(--roshta-font-sm);
+  border-radius: var(--roshta-radius-sm);
+  margin-bottom: var(--roshta-space-xs);
+}
+.r-banner--offline  { background: #3a2828; border-left: 3px solid var(--roshta-danger); }
+.r-banner--blocked  { background: #3a2828; border-left: 3px solid var(--roshta-danger); color: #f08080; }
+.r-banner--warning  { background: #3a3020; border-left: 3px solid var(--roshta-warning); }
+.r-banner--info     { background: #1e2a3a; border-left: 3px solid var(--roshta-accent); }
+
+/* ── Connection status dot ───────────────────────────────────────────────── */
+.r-dot {
+  width:  8px; height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  flex-shrink: 0;
+}
+.r-dot--online   { background: var(--roshta-success); box-shadow: 0 0 4px var(--roshta-success); }
+.r-dot--offline  { background: var(--roshta-text-dim); }
+.r-dot--blocked  { background: var(--roshta-danger); }
+.r-dot--connecting { background: var(--roshta-warning); animation: pulse 1s infinite; }
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.4; }
+}
+
+/* ── Section / form ──────────────────────────────────────────────────────── */
+.r-section {
+  border:  1px solid var(--roshta-border);
+  border-radius: var(--roshta-radius);
+  margin-bottom: var(--roshta-space-sm);
+  overflow: hidden;
+}
+.r-section-header {
+  background:   var(--roshta-bg-raised);
+  padding:      var(--roshta-space-xs) var(--roshta-space-sm);
+  font-size:    var(--roshta-font-sm);
+  font-weight:  600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color:        var(--roshta-text-muted);
+  display:      flex;
+  align-items:  center;
+  gap:          var(--roshta-space-xs);
+}
+.r-section-body { padding: var(--roshta-space-sm); }
+
+/* ── Form fields ─────────────────────────────────────────────────────────── */
+.r-field { margin-bottom: var(--roshta-space-sm); }
+.r-label {
+  display:     block;
+  font-size:   var(--roshta-font-sm);
+  color:       var(--roshta-text-muted);
+  margin-bottom: var(--roshta-space-xs);
+}
+.r-input, .r-select {
+  width:       100%;
+  background:  var(--roshta-bg-sunken);
+  border:      1px solid var(--roshta-border);
+  border-radius: var(--roshta-radius-sm);
+  color:       var(--roshta-text);
+  font-size:   var(--roshta-font-size);
+  padding:     4px 6px;
+  outline:     none;
+}
+.r-input:focus, .r-select:focus {
+  border-color: var(--roshta-accent);
+}
+.r-input--error { border-color: var(--roshta-danger); }
+.r-field-error {
+  color:       var(--roshta-danger);
+  font-size:   var(--roshta-font-sm);
+  margin-top:  2px;
+}
+
+/* ── Buttons ─────────────────────────────────────────────────────────────── */
+.r-btn {
+  display:     inline-flex;
+  align-items: center;
+  gap:         var(--roshta-space-xs);
+  padding:     4px var(--roshta-space-sm);
+  border-radius: var(--roshta-radius-sm);
+  border:      1px solid var(--roshta-border);
+  background:  var(--roshta-bg-raised);
+  color:       var(--roshta-text);
+  font-size:   var(--roshta-font-sm);
+  cursor:      pointer;
+  white-space: nowrap;
+}
+.r-btn:hover:not(:disabled)     { background: var(--roshta-bg-raised); border-color: var(--roshta-accent); }
+.r-btn:disabled                  { opacity: 0.4; cursor: not-allowed; }
+.r-btn--primary { background: var(--roshta-accent); border-color: var(--roshta-accent); color: #fff; }
+.r-btn--primary:hover:not(:disabled) { background: var(--roshta-accent-hover); }
+.r-btn--danger  { background: var(--roshta-danger);  border-color: var(--roshta-danger);  color: #fff; }
+.r-btn--sm { padding: 2px var(--roshta-space-xs); font-size: 10px; }
+
+/* ── Badge ───────────────────────────────────────────────────────────────── */
+.r-badge {
+  display:    inline-block;
+  padding:    1px 5px;
+  border-radius: 10px;
+  font-size:  10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.r-badge--done       { background: #1a3a1a; color: var(--roshta-success); }
+.r-badge--processing { background: #1a2a3a; color: var(--roshta-accent);  }
+.r-badge--waiting    { background: #2a2a2a; color: var(--roshta-text-muted); }
+.r-badge--review     { background: #3a1a1a; color: var(--roshta-danger);  }
+.r-badge--leased     { background: #1e2a3a; color: #6aaef0; }
+.r-badge--flagged    { background: #3a2a1a; color: var(--roshta-warning); }
+
+/* ── Run bar ─────────────────────────────────────────────────────────────── */
+.r-run-bar {
+  display:      flex;
+  align-items:  center;
+  gap:          var(--roshta-space-sm);
+  padding:      var(--roshta-space-xs) var(--roshta-space-sm);
+  background:   var(--roshta-bg-sunken);
+  border-top:   1px solid var(--roshta-border);
+  flex-shrink:  0;
+}
+.r-run-bar__status {
+  flex:         1;
+  font-size:    var(--roshta-font-sm);
+  color:        var(--roshta-text-muted);
+  overflow:     hidden;
+  text-overflow: ellipsis;
+  white-space:  nowrap;
+}
+.r-run-bar__status--running { color: var(--roshta-accent); }
+.r-run-bar__status--paused  { color: var(--roshta-warning); }
+.r-run-bar__status--error   { color: var(--roshta-danger); }
+
+/* ── Counters row ────────────────────────────────────────────────────────── */
+.r-counters {
+  display:  flex;
+  gap:      var(--roshta-space-sm);
+  font-size: var(--roshta-font-sm);
+  color:    var(--roshta-text-muted);
+  padding:  var(--roshta-space-xs) var(--roshta-space-sm);
+  border-bottom: 1px solid var(--roshta-border);
+}
+.r-counters span { display: flex; align-items: center; gap: 3px; }
+.r-counters .val { color: var(--roshta-text); font-weight: 600; }
+
+/* ── Scrollbar ───────────────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--roshta-border); border-radius: 2px; }

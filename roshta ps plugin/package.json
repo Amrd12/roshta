@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "scripts": {
     "preinstall": "npx npm-force-resolutions",
+    "test": "node --test test/**/*.test.js",
     "watch": "nodemon -w src -e js,jsx,json,css,html -w webpack.config.js -x npm run build",
     "build": "webpack --mode development",
     "uxp:load": "cd dist && uxp plugin load",

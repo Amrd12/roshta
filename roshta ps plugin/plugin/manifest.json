@@ -1,106 +1,74 @@
 {
-  "id": "ro12",
-  "name": "roshta",
-  "version": "1.0",
+  "id": "com.roshta.plugin",
+  "name": "Roshta",
+  "version": "1.0.0",
   "main": "index.html",
-  "manifestVersion": 4,
+  "manifestVersion": 5,
   "host": [
-    {
-      "app": "PS",
-      "minVersion": "22"
-    }
+    { "app": "PS", "minVersion": "23.0" }
   ],
+  "requiredPermissions": {
+    "network": {
+      "domains": [
+        "http://127.0.0.1:*",
+        "http://localhost:*"
+      ]
+    },
+    "localFileSystem": "fullAccess",
+    "launchProcess": {
+      "schemes": ["file"],
+      "extensions": [".exe"]
+    },
+    "ipc": { "enablePluginCommunication": false },
+    "clipboard": "readAndWrite",
+    "allowCodeGenerationFromStrings": false
+  },
   "entrypoints": [
     {
+      "type": "panel",
+      "id": "roshta-main",
+      "label": { "default": "Roshta" },
+      "minimumSize":  { "width": 240, "height": 400 },
+      "maximumSize":  { "width": 2000, "height": 2000 },
+      "preferredDockedSize":   { "width": 300, "height": 680 },
+      "preferredFloatingSize": { "width": 420, "height": 760 },
+      "menuItems": [
+        { "id": "reload",       "label": "Reload Plugin" },
+        { "id": "show-setup",   "label": "Settings…" }
+      ]
+    },
+    {
       "type": "command",
-      "id": "showAbout",
-      "label": {
-        "default": "About React Demo"
-      },
-      "shortcut": {
-        "mac": "shift+cmd+A",
-        "win": "ctrl+alt+A"
-      }
+      "id": "cmd-pause",
+      "label": { "default": "Roshta — Pause Queue" },
+      "shortcut": { "win": "ctrl+alt+P" }
     },
     {
-      "type": "panel",
-      "id": "demos",
-      "label": {
-        "default": "Demo Panel"
-      },
-      "minimumSize": {
-        "width": 230,
-        "height": 200
-      },
-      "maximumSize": {
-        "width": 2000,
-        "height": 2000
-      },
-      "preferredDockedSize": {
-        "width": 230,
-        "height": 300
-      },
-      "preferredFloatingSize": {
-        "width": 230,
-        "height": 300
-      }
+      "type": "command",
+      "id": "cmd-resume",
+      "label": { "default": "Roshta — Resume Queue" },
+      "shortcut": { "win": "ctrl+alt+R" }
     },
     {
-      "type": "panel",
-      "id": "moreDemos",
-      "label": {
-        "default": "Demo Panel 2"
-      },
-      "minimumSize": {
-        "width": 230,
-        "height": 200
-      },
-      "maximumSize": {
-        "width": 2000,
-        "height": 2000
-      },
-      "preferredDockedSize": {
-        "width": 230,
-        "height": 300
-      },
-      "preferredFloatingSize": {
-        "width": 230,
-        "height": 300
-      }
+      "type": "command",
+      "id": "cmd-after-finish",
+      "label": { "default": "Roshta — Toggle After-Finishing" }
     }
   ],
   "icons": [
     {
-      "width": 32,
-      "height": 32,
+      "width": 32, "height": 32,
       "path": "icons/icon_D.png",
-      "scale": [
-        1,
-        2
-      ],
-      "theme": [
-        "dark",
-        "darkest"
-      ],
-      "species": [
-        "generic"
-      ]
+      "scale": [1, 2],
+      "theme": ["dark", "darkest"],
+      "species": ["generic"]
     },
     {
-      "width": 32,
-      "height": 32,
+      "width": 32, "height": 32,
       "path": "icons/icon_N.png",
-      "scale": [
-        1,
-        2
-      ],
-      "theme": [
-        "lightest",
-        "light"
-      ],
-      "species": [
-        "generic"
-      ]
+      "scale": [1, 2],
+      "theme": ["lightest", "light"],
+      "species": ["generic"]
     }
   ]
 }
