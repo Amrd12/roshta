@@ -85,7 +85,7 @@ export function makeDefaultSettings() {
     // Plugin-owned (stored in UXP secure storage)
     host:  "127.0.0.1",
     port:  49200,
-    token: "",               // never shown again after first save
+    token: "roshta-dev-token-secret", // default dev token matching server
 
     // Server-owned folders
     source_folder:    "",

@@ -1,4 +1,12 @@
 import logging
+import sys
+from pathlib import Path
+
+# Ensure project root (parent of 'server') is on sys.path so 'server.*' imports resolve
+_project_root = Path(__file__).resolve().parent.parent
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
+
 from flask import Flask, request
 from server.config import config, AppConfig
 from server.database import init_db

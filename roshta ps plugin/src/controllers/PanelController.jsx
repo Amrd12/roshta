@@ -19,28 +19,72 @@ export class PanelController {
         ["create", "show", "hide", "destroy", "invokeMenu"].forEach(fn => this[fn] = this[fn].bind(this));
     }
 
-    create() {
-        this._root = document.createElement("div");
-        this._root.style.height = "100vh";
-        this._root.style.overflow = "auto";
-        this._root.style.padding = "0px";
+    create(event) {
+        console.log("[Roshta] PanelController create", this._id, event);
+        if (!this._root) {
+            this._root = document.createElement("div");
+            this._root.id = "roshta-panel-root";
+            this._root.style.width = "100%";
+            this._root.style.height = "100%";
+            this._root.style.boxSizing = "border-box";
+            this._root.style.overflow = "auto";
+            this._root.style.padding = "0px";
 
-        ReactDOM.render(this._Component({ panel: this }), this._root);
+            let element;
+            try {
+                const res = typeof this._Component === "function" ? this._Component({ panel: this }) : this._Component;
+                element = React.isValidElement(res) ? res : React.createElement(this._Component, { panel: this });
+            } catch (err) {
+                console.error("[Roshta] Component creation error:", err);
+                element = React.createElement(this._Component, { panel: this });
+            }
+
+            try {
+                ReactDOM.render(element, this._root);
+                console.log("[Roshta] React mounted successfully into panel root");
+            } catch (renderErr) {
+                console.error("[Roshta] ReactDOM.render error:", renderErr);
+                this._root.innerHTML = `<div style="color:red;padding:12px;">React Render Error: ${renderErr.message}</div>`;
+            }
+        }
+
+        const target = (event && event.node) || (event && typeof event.appendChild === "function" ? event : null);
+        if (target && this._root && !target.contains(this._root)) {
+            this._attachment = target;
+            target.appendChild(this._root);
+            console.log("[Roshta] Attached in create");
+        }
 
         return this._root;
     }
 
     show(event) {
+        console.log("[Roshta] PanelController show", this._id, event);
         if (!this._root) {
-            this.create();
+            this.create(event);
         }
-        this._attachment = event.node;
-        this._attachment.appendChild(this._root);
+
+        const target = (event && event.node)
+            || (event && typeof event.appendChild === "function" ? event : null)
+            || (typeof document !== "undefined" ? document.body : null);
+
+        if (target && this._root && !target.contains(this._root)) {
+            this._attachment = target;
+            target.appendChild(this._root);
+            console.log("[Roshta] Attached in show to", target);
+        }
     }
 
-    hide() {
+    hide(event) {
+        console.log("[Roshta] PanelController hide", this._id);
         if (this._attachment && this._root) {
-            this._attachment.removeChild(this._root);
+            try {
+                if (this._attachment.contains(this._root)) {
+                    this._attachment.removeChild(this._root);
+                }
+            } catch (e) {
+                // Ignore
+            }
             this._attachment = null;
         }
     }

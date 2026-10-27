@@ -1,3 +1,11 @@
+// Environment polyfills
+if (typeof global !== "undefined") {
+    global.screen = global.screen || {};
+}
+if (typeof window !== "undefined" && window.WebSocket && window.WebSocket.prototype) {
+    window.WebSocket.prototype.OPEN = 1;
+}
+
 import React from "react";
 import ReactDOM from "react-dom";
 
@@ -33,6 +41,8 @@ const pauseController = { run: pauseCommand };
 const resumeController = { run: resumeCommand };
 const afterFinishController = { run: afterFinishCommand };
 
+const c = mainPanelController;
+
 entrypoints.setup({
     plugin: {
         async create(plugin) {
@@ -51,7 +61,14 @@ entrypoints.setup({
         }
     },
     panels: {
-        "roshta-main": mainPanelController
+        "roshta-main": {
+            create: (e) => c.create(e),
+            show: (e) => c.show(e),
+            hide: (e) => c.hide(e),
+            destroy: () => c.destroy(),
+            invokeMenu: (id) => c.invokeMenu(id),
+            menuItems: c.menuItems
+        }
     },
     commands: {
         "cmd-pause": pauseController,

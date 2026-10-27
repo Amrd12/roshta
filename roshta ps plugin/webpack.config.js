@@ -9,7 +9,7 @@ module.exports = {
         filename: 'index.js',
         //libraryTarget: "commonjs2"
     },
-    devtool: 'cheap-eval-source-map', // won't work on XD due to lack of eval
+    devtool: false,
     externals: {
         uxp: 'commonjs2 uxp',
         photoshop: 'commonjs2 photoshop',

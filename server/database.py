@@ -10,11 +10,33 @@ logger = logging.getLogger("database")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MIGRATIONS_DIR = os.path.join(BASE_DIR, "migrations")
+DEFAULT_DB_PATH = os.path.join(BASE_DIR, "roshta.db")
+
+
+def resolve_db_path(db_path: str = None) -> str:
+    """Resolve database path, ensuring a valid path in the server folder if not specified."""
+    if not db_path:
+        try:
+            from flask import current_app, has_app_context
+            if has_app_context() and "APP_CONFIG" in current_app.config:
+                db_path = current_app.config["APP_CONFIG"].database_path
+        except Exception:
+            pass
+    path = db_path or getattr(config, "database_path", None) or DEFAULT_DB_PATH
+    return os.path.abspath(path)
+
+
+def ensure_db_exists(path: str) -> None:
+    """Ensure the target directory exists and the database file is created if not found in server folder."""
+    db_dir = os.path.dirname(path)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
 
 
 def get_connection(db_path: str = None) -> sqlite3.Connection:
     """
     Return a SQLite connection for the calling thread.
+    Creates the database file in the server folder if not found.
 
     WAL mode:     Allows concurrent readers while a single writer is active.
     FULL sync:    Flushes WAL frames to disk on each COMMIT. Safe against
@@ -23,14 +45,8 @@ def get_connection(db_path: str = None) -> sqlite3.Connection:
     busy_timeout: Waitress is multi-threaded; 5 s is enough for any lock
                   to clear before raising "database is locked".
     """
-    if not db_path:
-        try:
-            from flask import current_app, has_app_context
-            if has_app_context() and "APP_CONFIG" in current_app.config:
-                db_path = current_app.config["APP_CONFIG"].database_path
-        except Exception:
-            pass
-    path = db_path or config.database_path
+    path = resolve_db_path(db_path)
+    ensure_db_exists(path)
 
     # sqlite3.connect() is NOT thread-safe for shared connections.
     # Each caller (= each Waitress worker thread) must open its own connection.
@@ -72,9 +88,9 @@ def apply_migrations(db_path: str = None, migrations_dir: str = None) -> List[st
     Tracks applied migrations in schema_version by filename so each
     migration runs exactly once.
     """
-    path = db_path or config.database_path
+    path = resolve_db_path(db_path)
+    ensure_db_exists(path)
     mig_dir = migrations_dir or MIGRATIONS_DIR
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     os.makedirs(mig_dir, exist_ok=True)
 
     applied_now: List[str] = []
@@ -121,8 +137,10 @@ def apply_migrations(db_path: str = None, migrations_dir: str = None) -> List[st
 
 
 def init_db(db_path: str = None) -> None:
-    """Initialises the database by running all pending migrations."""
-    apply_migrations(db_path)
+    """Initialises the database by creating it if not found in server folder and running all pending migrations."""
+    path = resolve_db_path(db_path)
+    ensure_db_exists(path)
+    apply_migrations(path)
 
 
 def stamp_boot_id(db_path: str = None) -> str:

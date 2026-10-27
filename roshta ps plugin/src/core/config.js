@@ -46,7 +46,7 @@ export async function loadConfig() {
 
   let host  = defaults.host;
   let port  = defaults.port;
-  let token = "";
+  let token = defaults.token || "";
   let gap   = defaults.gap_between_jobs_seconds;
   let pauseN = defaults.pause_after_n_batches;
 

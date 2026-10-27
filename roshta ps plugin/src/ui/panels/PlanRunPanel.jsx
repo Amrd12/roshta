@@ -10,7 +10,13 @@ import { postControl } from "../../api/endpoints.js";
 import { Badge } from "../components/Badge.jsx";
 
 export function PlanRunPanel({ state }) {
-  const { serverMode, stateRev, counters, batches, warnings, connectionStatus } = state;
+  const safeState = state || {};
+  const serverMode = safeState.serverMode || "idle";
+  const stateRev = safeState.stateRev != null ? safeState.stateRev : 0;
+  const safeCounters = safeState.counters || { ready: 0, waiting: 0, done: 0, flagged: 0 };
+  const safeBatches = Array.isArray(safeState.batches) ? safeState.batches : [];
+  const connectionStatus = safeState.connectionStatus || "OFFLINE";
+
   const [controlLoading, setControlLoading] = useState(false);
   const [controlMsg, setControlMsg] = useState(null);
 
@@ -66,12 +72,12 @@ export function PlanRunPanel({ state }) {
 
       {/* ── Counters Row ─────────────────────────────────────────────────── */}
       <div className="r-counters" style={{ marginBottom: "8px" }}>
-        <span>Ready: <span className="val">{counters.ready || 0}</span></span>
-        <span>Waiting: <span className="val">{counters.waiting || 0}</span></span>
-        <span>Done: <span className="val">{counters.done || 0}</span></span>
-        {counters.flagged > 0 && (
+        <span>Ready: <span className="val">{safeCounters.ready || 0}</span></span>
+        <span>Waiting: <span className="val">{safeCounters.waiting || 0}</span></span>
+        <span>Done: <span className="val">{safeCounters.done || 0}</span></span>
+        {safeCounters.flagged > 0 && (
           <span style={{ color: "var(--roshta-danger)" }}>
-            Flagged: <span className="val">{counters.flagged}</span>
+            Flagged: <span className="val">{safeCounters.flagged}</span>
           </span>
         )}
       </div>
@@ -114,10 +120,10 @@ export function PlanRunPanel({ state }) {
       {/* ── Queue Batches ────────────────────────────────────────────────── */}
       <div className="r-section">
         <div className="r-section-header">
-          <span>Active Queue Batches ({batches ? batches.length : 0})</span>
+          <span>Active Queue Batches ({safeBatches.length})</span>
         </div>
         <div className="r-section-body">
-          {(!batches || batches.length === 0) ? (
+          {safeBatches.length === 0 ? (
             <div style={{ padding: "16px 8px", textAlign: "center", color: "var(--roshta-text-muted)", fontSize: "11px" }}>
               {connectionStatus !== "ONLINE"
                 ? "Connect to server to view live batches."
@@ -125,7 +131,7 @@ export function PlanRunPanel({ state }) {
             </div>
           ) : (
             <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
-              {batches.map((b, i) => {
+              {safeBatches.map((b, i) => {
                 const filledSlots = (b.slots || []).filter(s => !s.isEmpty).length;
                 return (
                   <div

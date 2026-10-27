@@ -13,7 +13,13 @@ import { getHealth, getState } from "../../api/endpoints.js";
 import { validateSettings } from "../../models/Settings.js";
 
 export function SetupPanel({ state }) {
-  const { settings, connectionStatus, serverVersion, serverUptime, bootId, photoshopDetected } = state;
+  const safeState = state || {};
+  const settings = safeState.settings || {};
+  const connectionStatus = safeState.connectionStatus || "OFFLINE";
+  const serverVersion = safeState.serverVersion;
+  const serverUptime = safeState.serverUptime;
+  const bootId = safeState.bootId;
+  const photoshopDetected = safeState.photoshopDetected;
 
   const [host, setHost] = useState(settings.host || "127.0.0.1");
   const [port, setPort] = useState(settings.port || 49200);
